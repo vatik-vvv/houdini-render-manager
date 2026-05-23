@@ -1,0 +1,17 @@
+{
+    "telegram": {
+        "bot_token": "",
+        "chat_id": "",
+        "preview_max_side": 2000
+    },
+    "ui": {
+        "width": 1200,
+        "height": 800
+    },
+    "filters": {
+        "redshift": false,
+        "karma": false,
+        "other": false
+    },
+    "hython_path": "C:\\Program Files\\Side Effects Software\\Houdini 21.0.707\\bin\\hython.exe"
+}
