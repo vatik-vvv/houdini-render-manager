@@ -1,9 +1,0 @@
-﻿render_manager/
-├── main.py              # Точка входа, запуск UI
-├── ui_main.py           # PySide6 интерфейс
-├── queue_manager.py     # Очередь задач (сохранение/загрузка JSON)
-├── houdini_adapter.py   # Определение версии Houdini, запуск рендера
-├── render_runner.py     # Логика выполнения задач
-├── telegram_notifier.py # Отправка сообщений в Telegram
-├── config.json          # Настройки (бот токен, chat_id, UI размеры)
-└── queue.json           # Очередь рендера (сохраняется между перезапусками)

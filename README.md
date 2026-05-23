@@ -2,44 +2,31 @@
 
 PySide6 desktop app for scanning Houdini `.hip` files for ROP nodes, managing a render queue, and sending Telegram notifications.
 
-**GitHub:** after publishing, the repo will be `https://github.com/vatik-vvv/houdini-render-manager` (see [Publish to GitHub](#publish-to-github) below).
+**Repository:** https://github.com/vatik-vvv/houdini-render-manager
 
 ## Requirements
 
 - Python 3.10+
-- [Houdini](https://www.sidefx.com/) with `hython.exe` on your system
-- Windows (primary target; paths in config use Windows style)
+- [Houdini](https://www.sidefx.com/) with `hython.exe`
+- Windows (primary target)
 
 ## Setup
 
 ```powershell
-cd e:\hou_Rmanager
+cd E:\hou_Rmanager
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-```
-
-Copy the example config and edit paths and Telegram settings:
-
-```powershell
 Copy-Item config.example.json config.json
 ```
 
-`config.json` and `queue.json` are gitignored so local tokens and queue state are not committed.
+Edit `config.json`: `hython_path`, Telegram `bot_token` / `chat_id`. Queue and UI state are stored in `config.json` (gitignored).
 
 ## Run
 
 ```powershell
 python main.py
 ```
-
-When several HIP files are listed, **Scan HIP** uses the current (last-clicked) file; the label under the HIP list shows which file will be scanned.
-
-**Queue UI:** status column is color-coded; duration is computed from start/end times; a progress line shows the active job during render; HIP/output paths show a short label with full path in the tooltip; **Enable all** / **Disable all** toggle every row; duplicate HIP+ROP pairs are skipped when adding to the queue.
-
-**Paths:** ROP scan keeps Houdini expressions (`$HIP`, `$F4`, …) via `unexpandedValue`; render uses [`path_utils.py`](path_utils.py) to create folders and pass templates to `hrender` without breaking `$HIP`. Tooltip shows resolved path preview.
-
-**Phase 3:** **Add all visible** ROPs; right-click menus on HIP list and queue; **Stop** asks for confirmation.
 
 ## Build executable
 
@@ -48,52 +35,23 @@ pip install pyinstaller
 pyinstaller main.spec
 ```
 
-Output: `dist/HoudiniRenderManager.exe` (one-file build). Place `config.json` next to the exe (copy from `config.example.json`). Helper scripts `scan_rops.py` and `render_rop.py` are bundled inside the exe for `hython`.
-
-Build artifacts under `build/` are ignored by git.
-
-### Quick test (built exe)
-
-```powershell
-cd dist
-Copy-Item ..\config.example.json config.json
-.\HoudiniRenderManager.exe
-```
-
-See `dist/README.txt` for details.
-
-## Publish to GitHub
-
-The project is committed locally on branch `main`. To create the remote repository and push:
-
-```powershell
-cd e:\hou_Rmanager
-
-# Portable GitHub CLI (no winget/admin needed):
-.\tools\install_gh.ps1
-.\tools\gh-auth-login.ps1
-
-.\publish_to_github.ps1
-```
-
-Or install [GitHub CLI](https://cli.github.com/) system-wide and use `gh auth login` from PATH.
-
-Or manually: create an empty public repo **houdini-render-manager** on GitHub, then:
-
-```powershell
-git remote add origin https://github.com/YOUR_USER/houdini-render-manager.git
-git push -u origin main
-```
+Output: `dist/HoudiniRenderManager.exe`. Copy `config.example.json` to `dist/config.json` next to the exe.
 
 ## Project layout
 
 | File | Purpose |
 |------|---------|
-| `app_paths.py` | Paths for dev vs PyInstaller exe |
-| `main.py` | Application entry point |
-| `ui_main.py` | PySide6 UI |
-| `queue_manager.py` | Queue persistence |
-| `houdini_adapter.py` | Houdini integration helpers |
-| `render_runner.py` | Render execution |
-| `scan_rops.py` | ROP scan script (run via `hython`) |
+| `main.py` | Entry point |
+| `ui_main.py` | PySide6 UI and queue |
+| `app_paths.py` | Paths for dev vs frozen exe |
+| `render_runner.py` | Subprocess render + Telegram |
+| `render_rop.py` | `hython` render script (skip frames, resize) |
+| `scan_rops.py` | `hython` ROP scan script |
+| `path_utils.py` | `$HIP`, `$OS`, frame paths |
+| `frame_preview.py` | Telegram frame previews |
+| `render_progress.py` | Frame progress from render log |
 | `telegram_notifier.py` | Telegram Bot API |
+| `config.example.json` | Example configuration |
+| `main.spec` | PyInstaller spec |
+
+Optional: `tools/install_gh.ps1`, `publish_to_github.ps1` — one-time GitHub publish helpers.
