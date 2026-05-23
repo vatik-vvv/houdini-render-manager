@@ -2,6 +2,8 @@
 
 PySide6 desktop app for scanning Houdini `.hip` files for ROP nodes, managing a render queue, and sending Telegram notifications.
 
+**GitHub:** after publishing, the repo will be `https://github.com/vatik-vvv/houdini-render-manager` (see [Publish to GitHub](#publish-to-github) below).
+
 ## Requirements
 
 - Python 3.10+
@@ -50,10 +52,41 @@ Output: `dist/HoudiniRenderManager.exe` (one-file build). Place `config.json` ne
 
 Build artifacts under `build/` are ignored by git.
 
+### Quick test (built exe)
+
+```powershell
+cd dist
+Copy-Item ..\config.example.json config.json
+.\HoudiniRenderManager.exe
+```
+
+See `dist/README.txt` for details.
+
+## Publish to GitHub
+
+The project is committed locally on branch `main`. To create the remote repository and push:
+
+```powershell
+# One-time: install GitHub CLI and log in
+# https://cli.github.com/
+gh auth login
+
+cd e:\hou_Rmanager
+.\publish_to_github.ps1
+```
+
+Or manually: create an empty public repo **houdini-render-manager** on GitHub, then:
+
+```powershell
+git remote add origin https://github.com/YOUR_USER/houdini-render-manager.git
+git push -u origin main
+```
+
 ## Project layout
 
 | File | Purpose |
 |------|---------|
+| `app_paths.py` | Paths for dev vs PyInstaller exe |
 | `main.py` | Application entry point |
 | `ui_main.py` | PySide6 UI |
 | `queue_manager.py` | Queue persistence |
