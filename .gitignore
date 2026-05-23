@@ -17,6 +17,10 @@ queue.json
 build/
 dist/
 
+# Local GitHub CLI download (run tools/install_gh.ps1)
+tools/gh/
+tools/gh_extract/
+
 # IDE / OS
 .idea/
 .vscode/

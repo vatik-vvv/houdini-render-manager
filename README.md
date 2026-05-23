@@ -67,13 +67,16 @@ See `dist/README.txt` for details.
 The project is committed locally on branch `main`. To create the remote repository and push:
 
 ```powershell
-# One-time: install GitHub CLI and log in
-# https://cli.github.com/
-gh auth login
-
 cd e:\hou_Rmanager
+
+# Portable GitHub CLI (no winget/admin needed):
+.\tools\install_gh.ps1
+.\tools\gh-auth-login.ps1
+
 .\publish_to_github.ps1
 ```
+
+Or install [GitHub CLI](https://cli.github.com/) system-wide and use `gh auth login` from PATH.
 
 Or manually: create an empty public repo **houdini-render-manager** on GitHub, then:
 

@@ -1,16 +1,18 @@
-# Create GitHub repo and push (run once after: gh auth login)
+# Create GitHub repo and push (run once after: .\tools\gh-auth-login.ps1)
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
-$gh = Get-Command gh -ErrorAction SilentlyContinue
-if (-not $gh) {
-    $portable = Join-Path $env:TEMP "gh-cli\bin\gh.exe"
-    if (Test-Path $portable) { $gh = $portable } else {
-        Write-Host "Install GitHub CLI: https://cli.github.com/  then run: gh auth login"
-        exit 1
-    }
+$localGh = Join-Path $PSScriptRoot "tools\gh\bin\gh.exe"
+$ghCmd = Get-Command gh -ErrorAction SilentlyContinue
+if ($ghCmd) {
+    $gh = $ghCmd.Source
+} elseif (Test-Path $localGh) {
+    $gh = $localGh
 } else {
-    $gh = $gh.Source
+    Write-Host "GitHub CLI not found. Run:"
+    Write-Host "  .\tools\install_gh.ps1"
+    Write-Host "  .\tools\gh-auth-login.ps1"
+    exit 1
 }
 
 & $gh auth status 2>&1 | Out-Null
