@@ -31,3 +31,17 @@ def bundled_script(filename):
 
 def config_path():
     return os.path.join(app_dir(), "config.json")
+
+
+APP_ICON_ICO = "HouRM_icon.ico"
+APP_ICON_PNG = "HouRM_icon.png"
+
+
+def app_icon_path():
+    """Multi-size .ico for Qt and shell; .png fallback."""
+    for name in (APP_ICON_ICO, APP_ICON_PNG):
+        for base in (bundle_dir(), app_dir()):
+            path = os.path.join(base, name)
+            if os.path.isfile(path):
+                return path
+    return os.path.join(bundle_dir(), APP_ICON_ICO)

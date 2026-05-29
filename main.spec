@@ -4,8 +4,8 @@ from PyInstaller.utils.hooks import collect_all
 block_cipher = None
 
 extra_datas = [
-    ("app_icon.png", "."),
-    ("app_icon.ico", "."),
+    ("HouRM_icon.png", "."),
+    ("HouRM_icon.ico", "."),
     ("render_rop.py", "."),
     ("scan_rops.py", "."),
     ("config.example.json", "."),
@@ -63,5 +63,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon="app_icon.ico",
+    icon="HouRM_icon.ico",
 )

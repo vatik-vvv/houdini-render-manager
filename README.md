@@ -32,6 +32,7 @@ python main.py
 
 ```powershell
 pip install pyinstaller
+python tools/build_app_icon.py   # multi-size .ico for Explorer / taskbar
 pyinstaller main.spec
 ```
 

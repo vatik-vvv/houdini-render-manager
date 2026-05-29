@@ -3,7 +3,7 @@ import glob, os, json, re, subprocess, requests, sys
 from datetime import datetime
 from render_runner import run_render, stop_render
 from telegram_notifier import send_image
-from app_paths import config_path, bundled_script
+from app_paths import config_path, bundled_script, app_icon_path
 from path_utils import (
     norm_path_key,
     resolve_houdini_vars,
@@ -737,7 +737,7 @@ class RenderManager(QWidget):
       self._resize_update_guard = False
       
       self.setWindowTitle(TRANSLATIONS[self.current_language]["title"])
-      icon_path = resource_path("app_icon.png")
+      icon_path = app_icon_path()
       if os.path.exists(icon_path):
           self.setWindowIcon(QIcon(icon_path))
       self.setAcceptDrops(True)
