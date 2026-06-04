@@ -3,7 +3,7 @@ import glob, os, json, re, subprocess, requests, sys
 from datetime import datetime
 from render_runner import run_render, stop_render
 from telegram_notifier import send_image
-from app_paths import config_path, bundled_script, app_icon_path
+from app_paths import config_path, bundled_script, app_icon_path, find_bundled_file
 from path_utils import (
     norm_path_key,
     resolve_houdini_vars,
@@ -19,10 +19,11 @@ from PySide6.QtWidgets import (
       QSizePolicy, QStyledItemDelegate, QStyle, QStyleOptionButton, QStyleOptionViewItem,
       QMessageBox, QMenu, QLineEdit, QSpinBox
   )
-from PySide6.QtGui import QPalette, QColor, QIcon, QFont, QPainter, QPen
+from PySide6.QtGui import QPalette, QColor, QIcon, QFont, QPainter, QPen, QPixmap
 from PySide6.QtCore import Qt, QByteArray, QMimeData, QThread, Signal, QEvent, QRect, QSize
 
 CONFIG_FILE = config_path()
+HEADER_LOGO_HEIGHT_PX = 27
 TOGGLE_ON_COLOR = QColor(76, 175, 80)
 TOGGLE_OFF_COLOR = QColor(211, 47, 47)
 QUEUE_COLUMN_KEYS = [
@@ -253,10 +254,9 @@ class GripSplitterHandle(QSplitterHandle):
 
 
 class MainSplitter(QSplitter):
-    """Zone 1 fixed (flat handle); zone 5 resizable via matching grips above and below."""
+    """Render queue (zone 5) resizable via grips above and below it."""
 
-    ZONE1_HANDLE_INDEX = 0
-    QUEUE_HANDLE_INDEXES = (1, 2)
+    QUEUE_HANDLE_INDEXES = (0, 1)
 
     def createHandle(self):
         return GripSplitterHandle(self.orientation(), self)
@@ -266,11 +266,7 @@ class MainSplitter(QSplitter):
             handle = self.handle(idx)
             if handle is None or not isinstance(handle, GripSplitterHandle):
                 continue
-            if idx == self.ZONE1_HANDLE_INDEX:
-                handle.set_style(GripSplitterHandle.STYLE_FLAT)
-                handle.setEnabled(False)
-                handle.setToolTip("")
-            elif idx in self.QUEUE_HANDLE_INDEXES:
+            if idx in self.QUEUE_HANDLE_INDEXES:
                 handle.set_style(GripSplitterHandle.STYLE_QUEUE)
                 handle.setEnabled(True)
                 if queue_tooltip:
@@ -344,6 +340,12 @@ def apply_dark_theme(widget):
     }
     QLabel {
         color: #ffffff;
+    }
+    QLabel#appTitleLabel {
+        font-size: 17px;
+        font-weight: bold;
+        letter-spacing: 2px;
+        color: #e8e8e8;
     }
     QCheckBox {
         color: #ffffff;
@@ -724,6 +726,18 @@ class RenderQueueWorker(QThread):
       return ext in {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp", ".exr"}
 
 class RenderManager(QWidget):
+  def _apply_header_logo(self, logo_path):
+      if not logo_path or not hasattr(self, "app_logo_label"):
+          return
+      logo_px = QPixmap(logo_path)
+      if logo_px.isNull():
+          return
+      scaled_logo = logo_px.scaledToHeight(
+          HEADER_LOGO_HEIGHT_PX, Qt.TransformationMode.SmoothTransformation
+      )
+      self.app_logo_label.setPixmap(scaled_logo)
+      self.app_logo_label.setFixedSize(scaled_logo.size())
+
   def __init__(self):
       super().__init__()
       self.current_language = "en"
@@ -782,6 +796,23 @@ class RenderManager(QWidget):
       zone1.addWidget(self.language_btn)
 
       group1.setLayout(zone1)
+
+      self._top_bar = QWidget()
+      self._top_bar.setObjectName("appHeader")
+      top_layout = QHBoxLayout(self._top_bar)
+      top_layout.setContentsMargins(0, 0, 0, 6)
+      top_layout.setSpacing(12)
+      top_layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+
+      self.app_logo_label = QLabel()
+      self.app_logo_label.setScaledContents(False)
+      self.app_title_label = QLabel("HOUDINI RENDER MANAGER")
+      self.app_title_label.setObjectName("appTitleLabel")
+      self._apply_header_logo(find_bundled_file("logo_met2.png"))
+
+      top_layout.addWidget(self.app_logo_label, 0, Qt.AlignmentFlag.AlignVCenter)
+      top_layout.addWidget(self.app_title_label, 0, Qt.AlignmentFlag.AlignVCenter)
+      top_layout.addWidget(group1, 1)
 
       # --- Zone 2 & 3 ---
       top_zone_layout = QHBoxLayout()
@@ -996,13 +1027,13 @@ class RenderManager(QWidget):
       clear_log_btn.clicked.connect(self.clear_log)
 
       self.main_splitter = MainSplitter(Qt.Orientation.Vertical)
-      self.main_splitter.addWidget(group1)
       self.main_splitter.addWidget(top_container)
       self.main_splitter.addWidget(group5)
       self.main_splitter.addWidget(self.log_output)
       self.main_splitter.configure_handles(
           TRANSLATIONS[self.current_language]["splitter_queue_resize"]
       )
+      main_layout.addWidget(self._top_bar)
       main_layout.addWidget(self.main_splitter)
       main_layout.addWidget(clear_log_btn)
 
@@ -1014,10 +1045,7 @@ class RenderManager(QWidget):
       # Apply dark theme
       apply_dark_theme(self)
       
-      # Set fixed height for zone 1
-      self.main_splitter.setCollapsible(0, False)  # Zone 1 not collapsible
-      self.main_splitter.setStretchFactor(0, 0)    # Zone 1 fixed size
-      self.main_splitter.setSizes([90, self.main_splitter.height() - 90 - 200 - 150, 200, 150])  # Approximate sizes
+      self.main_splitter.setSizes([400, 200, 150])
 
   def restore_window(self):
       if os.path.exists(CONFIG_FILE):
@@ -1288,6 +1316,7 @@ class RenderManager(QWidget):
       self.ui_elements["group5"].setTitle(t["zone5"])
       if hasattr(self, "main_splitter"):
           self.main_splitter.configure_handles(t["splitter_queue_resize"])
+      self._apply_header_logo(find_bundled_file("logo_met2.png"))
 
       self.ui_elements["browse_btn"].setText(t["browse"])
       self.ui_elements["save_btn"].setText(t["save_settings"])

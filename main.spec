@@ -6,6 +6,7 @@ block_cipher = None
 extra_datas = [
     ("HouRM_icon.png", "."),
     ("HouRM_icon.ico", "."),
+    ("logo_met2.png", "."),
     ("render_rop.py", "."),
     ("scan_rops.py", "."),
     ("config.example.json", "."),
