@@ -83,6 +83,7 @@ logger = logging.getLogger(__name__)
 
 
 current_process = None
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def get_hrender_path():
@@ -503,19 +504,16 @@ def run_render(
 
 
 
-        current_process = subprocess.Popen(
+        popen_kw = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "bufsize": 1,
+        }
+        if os.name == "nt":
+            popen_kw["creationflags"] = CREATE_NO_WINDOW
 
-            cmd,
-
-            stdout=subprocess.PIPE,
-
-            stderr=subprocess.PIPE,
-
-            text=True,
-
-            bufsize=1,
-
-        )
+        current_process = subprocess.Popen(cmd, **popen_kw)
 
 
 

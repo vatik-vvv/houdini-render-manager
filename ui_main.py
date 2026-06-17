@@ -2413,11 +2413,12 @@ class RenderManager(QWidget):
           return None, f"Hython not found: {hython_path}"
       try:
           scan_script = hython_script_path("scan_rops.py")
+          run_kw = {"capture_output": True, "text": True, "timeout": 30}
+          if os.name == "nt":
+              run_kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
           result = subprocess.run(
               [hython_path, scan_script, hip_file],
-              capture_output=True,
-              text=True,
-              timeout=30
+              **run_kw
           )
           if result.returncode == 0:
               stdout_content = result.stdout.strip()
