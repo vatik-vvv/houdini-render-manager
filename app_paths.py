@@ -1,5 +1,6 @@
 """Paths for dev run vs PyInstaller frozen executable."""
 import os
+import shutil
 import sys
 
 
@@ -27,6 +28,20 @@ def bundled_script(filename):
         return path
     fallback = os.path.join(app_dir(), filename)
     return fallback if os.path.isfile(fallback) else path
+
+
+def hython_script_path(filename):
+    """Stable .py path for hython — beside .exe when frozen (PyInstaller _MEIPASS is internal)."""
+    src = bundled_script(filename)
+    if not os.path.isfile(src) or not is_frozen():
+        return src
+    dest = os.path.join(app_dir(), filename)
+    try:
+        if not os.path.isfile(dest) or os.path.getmtime(src) > os.path.getmtime(dest):
+            shutil.copy2(src, dest)
+    except OSError:
+        return src
+    return dest if os.path.isfile(dest) else src
 
 
 def find_bundled_file(filename):

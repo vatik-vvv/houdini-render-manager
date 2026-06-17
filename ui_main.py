@@ -3,7 +3,7 @@ import glob, os, json, re, subprocess, requests, sys
 from datetime import datetime
 from render_runner import run_render, stop_render
 from telegram_notifier import send_image
-from app_paths import config_path, bundled_script, app_icon_path, find_bundled_file
+from app_paths import config_path, bundled_script, app_icon_path, find_bundled_file, hython_script_path
 from path_utils import (
     norm_path_key,
     resolve_houdini_vars,
@@ -2412,7 +2412,7 @@ class RenderManager(QWidget):
       if not os.path.exists(hython_path):
           return None, f"Hython not found: {hython_path}"
       try:
-          scan_script = bundled_script("scan_rops.py")
+          scan_script = hython_script_path("scan_rops.py")
           result = subprocess.run(
               [hython_path, scan_script, hip_file],
               capture_output=True,

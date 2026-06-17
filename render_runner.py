@@ -22,7 +22,7 @@ from path_utils import (
 
 )
 
-from app_paths import app_dir, bundled_script, config_path
+from app_paths import config_path, hython_script_path
 from render_progress import progress_from_line
 
 from telegram_notifier import send_message
@@ -83,11 +83,6 @@ logger = logging.getLogger(__name__)
 
 
 current_process = None
-
-SCRIPT_DIR = app_dir()
-
-
-
 
 
 def get_hrender_path():
@@ -175,18 +170,11 @@ def _handle_output_line(line, start_frame, end_frame, progress_callback, last_ra
 
 
 def _build_hython_render_cmd(
-
-    hython_path, scene, rop, start_frame, end_frame, actual_x, actual_y, output_for_cmd, skip_existing_frames, resize_pct=100.0
-
+    hython_path, render_script, scene, rop, start_frame, end_frame, actual_x, actual_y, output_for_cmd, skip_existing_frames, resize_pct=100.0
 ):
-
-    script = os.path.join(SCRIPT_DIR, "render_rop.py")
-
     cmd = [
-
         hython_path,
-
-        script,
+        render_script,
 
         "--hip",
 
@@ -428,7 +416,7 @@ def run_render(
 
         hython_path = os.path.normpath(get_hython_path())
 
-        render_rop_script = bundled_script("render_rop.py")
+        render_rop_script = hython_script_path("render_rop.py")
 
         use_hython_render = (
             hython_path
@@ -445,9 +433,8 @@ def run_render(
         if use_hython_render:
 
             cmd = _build_hython_render_cmd(
-
                 hython_path,
-
+                render_rop_script,
                 scene,
 
                 rop,
