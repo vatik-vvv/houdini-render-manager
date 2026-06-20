@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
       QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QListWidget, QComboBox,
       QFileDialog, QLabel, QDialog, QLineEdit, QTableWidget, QTableWidgetItem,
       QTextEdit, QCheckBox, QGroupBox, QApplication, QAbstractItemView, QSplitter,
-      QSplitterHandle,
+      QSplitterHandle, QHeaderView,
       QSizePolicy, QStyledItemDelegate, QStyle, QStyleOptionButton, QStyleOptionViewItem,
       QMessageBox, QMenu, QLineEdit, QSpinBox
   )
@@ -98,6 +98,9 @@ TRANSLATIONS = {
         "open_hip": "Open HIP",
         "open_output": "Open output folder",
         "duplicate": "Duplicate",
+        "move_up": "Move up",
+        "move_down": "Move down",
+        "queue_reorder_blocked": "Cannot reorder queue while rendering.",
         "duplicate_rop": "Already in queue: {rop} ({hip})",
         "rop_count": "Shown: {shown} / {total}",
         "add_all_rops": "Add all visible",
@@ -107,6 +110,8 @@ TRANSLATIONS = {
         "ctx_enable": "Enable",
         "ctx_disable": "Disable",
         "ctx_duplicate": "Duplicate",
+        "ctx_move_up": "Move up",
+        "ctx_move_down": "Move down",
         "ctx_reset": "Reset from HIP",
         "ctx_remove": "Remove from queue",
         "ctx_open_hip": "Open HIP",
@@ -160,6 +165,9 @@ TRANSLATIONS = {
         "open_hip": "Открыть HIP",
         "open_output": "Папка вывода",
         "duplicate": "Дублировать",
+        "move_up": "Выше",
+        "move_down": "Ниже",
+        "queue_reorder_blocked": "Нельзя менять порядок очереди во время рендера.",
         "duplicate_rop": "Уже в очереди: {rop} ({hip})",
         "rop_count": "Показано: {shown} / {total}",
         "add_all_rops": "Добавить все видимые",
@@ -169,6 +177,8 @@ TRANSLATIONS = {
         "ctx_enable": "Включить",
         "ctx_disable": "Выключить",
         "ctx_duplicate": "Дублировать",
+        "ctx_move_up": "Выше",
+        "ctx_move_down": "Ниже",
         "ctx_reset": "Сбросить из HIP",
         "ctx_remove": "Удалить из очереди",
         "ctx_open_hip": "Открыть HIP",
@@ -373,6 +383,13 @@ def apply_dark_theme(widget):
         color: #ffffff;
         border: 1px solid #8e2dc5;
     }
+    QTableWidget {
+        gridline-color: #404040;
+        alternate-background-color: #1e1e1e;
+    }
+    QTableWidget::item {
+        padding: 2px 6px;
+    }
     QSplitter::handle:vertical {
         background: #3a3a3a;
     }
@@ -541,17 +558,26 @@ class HipList(QListWidget):
               parent.save_state()
 
 class RenderQueueTable(QTableWidget):
+  """Queue table — custom row reorder (Qt InternalMove corrupts custom cell data)."""
+
   def __init__(self, parent=None):
       super().__init__(parent)
-      self.setDragDropMode(QAbstractItemView.InternalMove)
-      self.setDefaultDropAction(Qt.DropAction.MoveAction)
-      self.setSelectionBehavior(QAbstractItemView.SelectRows)
-      self.setSelectionMode(QAbstractItemView.SingleSelection)
+      self.setDragDropMode(QAbstractItemView.DragDropMode.NoDragDrop)
+      self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+      self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
       self.setAlternatingRowColors(True)
-      self.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
+      self.setShowGrid(True)
+      self.setEditTriggers(
+          QAbstractItemView.EditTrigger.DoubleClicked
+          | QAbstractItemView.EditTrigger.EditKeyPressed
+      )
       self.parent_window = parent
+      self.verticalHeader().setVisible(False)
       self.verticalHeader().setDefaultSectionSize(28)
-      self._drag_src_row = -1
+      self._press_row = -1
+      self._press_pos = None
+      self._dragging = False
+      self.setMouseTracking(True)
 
   def data(self, index, role):
       if role == Qt.ItemDataRole.BackgroundRole and index.column() in (0, 6):
@@ -560,83 +586,57 @@ class RenderQueueTable(QTableWidget):
               return item.background()
       return super().data(index, role)
 
-  def dropMimeData(self, row, column, data, action):
-      """Block Qt default InternalMove — it corrupts custom item roles/delegates."""
-      return False
-
-  def startDrag(self, supportedActions):
-      indexes = self.selectedIndexes()
-      self._drag_src_row = indexes[0].row() if indexes else -1
-      super().startDrag(supportedActions)
-
-  def _take_row_items(self, row):
-      return [self.takeItem(row, col) for col in range(self.columnCount())]
-
-  def _set_row_items(self, row, items):
-      for col, item in enumerate(items):
-          if item is not None:
-              self.setItem(row, col, item)
-
-  def dragEnterEvent(self, event):
-      if event.mimeData().hasFormat("application/x-qabstractitemmodeldatalist"):
-          event.acceptProposedAction()
-
-  def dragMoveEvent(self, event):
-      event.acceptProposedAction()
-
-  def dropEvent(self, event):
-      if not self._drag_source_is_self(event):
-          event.ignore()
-          return
-
-      src_row = self._drag_src_row
-      if src_row < 0:
-          selected = self.selectedIndexes()
-          src_row = selected[0].row() if selected else -1
-      if src_row < 0 or src_row >= self.rowCount():
-          self._drag_src_row = -1
-          event.ignore()
-          return
-
-      drop_pos = event.position().toPoint()
-      drop_index = self.indexAt(drop_pos)
-      if drop_index.isValid():
-          dest_row = drop_index.row()
-          if drop_pos.y() > self.visualRect(drop_index).center().y():
-              dest_row += 1
-      else:
-          dest_row = self.rowCount()
-
-      dest_row = max(0, min(dest_row, self.rowCount()))
-      if src_row == dest_row or src_row + 1 == dest_row:
-          self._drag_src_row = -1
-          event.accept()
-          return
-
-      items = self._take_row_items(src_row)
-      self.removeRow(src_row)
-      if dest_row > src_row:
-          dest_row -= 1
-      self.insertRow(dest_row)
-      self._set_row_items(dest_row, items)
-      self.selectRow(dest_row)
-      self._drag_src_row = -1
-      event.accept()
-
-      if self.parent_window and hasattr(self.parent_window, "save_state"):
-          self.parent_window.save_state()
-
-  def _drag_source_is_self(self, event):
-      src = event.source()
-      return src is self or src is self.viewport()
+  def _insert_index_at(self, pos):
+      idx = self.indexAt(pos)
+      if not idx.isValid():
+          return self.rowCount()
+      row = idx.row()
+      if pos.y() > self.visualRect(idx).center().y():
+          row += 1
+      return max(0, min(row, self.rowCount()))
 
   def mousePressEvent(self, event):
-      # Allow normal cell clicks and editing; deselect only when clicking empty area
-      if event.button() == Qt.LeftButton:
+      if event.button() == Qt.MouseButton.LeftButton:
           index = self.indexAt(event.pos())
-          if not index.isValid():
+          if index.isValid():
+              self._press_row = index.row()
+              self._press_pos = event.pos()
+              self._dragging = False
+          else:
+              self._press_row = -1
               self.clearSelection()
       super().mousePressEvent(event)
+
+  def mouseMoveEvent(self, event):
+      if (
+          self._press_row >= 0
+          and event.buttons() & Qt.MouseButton.LeftButton
+          and self._press_pos is not None
+      ):
+          if not self._dragging:
+              dist = (event.pos() - self._press_pos).manhattanLength()
+              if dist >= QApplication.startDragDistance():
+                  self._dragging = True
+                  self.selectRow(self._press_row)
+          if self._dragging:
+              self.viewport().setCursor(Qt.CursorShape.DragMoveCursor)
+      super().mouseMoveEvent(event)
+
+  def mouseReleaseEvent(self, event):
+      if (
+          event.button() == Qt.MouseButton.LeftButton
+          and self._dragging
+          and self._press_row >= 0
+          and self.parent_window
+          and hasattr(self.parent_window, "_move_queue_row")
+      ):
+          dest = self._insert_index_at(event.pos())
+          self.parent_window._move_queue_row(self._press_row, dest)
+      self._press_row = -1
+      self._press_pos = None
+      self._dragging = False
+      self.viewport().unsetCursor()
+      super().mouseReleaseEvent(event)
 
 class RenderQueueWorker(QThread):
   log_signal = Signal(str)
@@ -999,6 +999,10 @@ class RenderManager(QWidget):
       self.queue_table.setColumnWidth(2, 180)
       self.queue_table.setColumnWidth(6, 56)
       self.queue_table.setColumnWidth(10, 320)
+      queue_header = self.queue_table.horizontalHeader()
+      queue_header.setStretchLastSection(True)
+      queue_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+      queue_header.setMinimumSectionSize(40)
       self.toggle_delegate = ToggleCheckBoxDelegate(
           self.queue_table, on_toggled=self._on_queue_toggle_changed
       )
@@ -1044,6 +1048,16 @@ class RenderManager(QWidget):
       self.ui_elements["disable_all_btn"] = self.disable_all_btn
       self.disable_all_btn.clicked.connect(lambda: self.set_all_queue_enabled(False))
       btn_layout2.addWidget(self.disable_all_btn)
+
+      self.move_up_btn = QPushButton(TRANSLATIONS[self.current_language]["move_up"])
+      self.ui_elements["move_up_btn"] = self.move_up_btn
+      self.move_up_btn.clicked.connect(self.move_queue_row_up)
+      btn_layout2.addWidget(self.move_up_btn)
+
+      self.move_down_btn = QPushButton(TRANSLATIONS[self.current_language]["move_down"])
+      self.ui_elements["move_down_btn"] = self.move_down_btn
+      self.move_down_btn.clicked.connect(self.move_queue_row_down)
+      btn_layout2.addWidget(self.move_down_btn)
 
       self.open_hip_btn = QPushButton(TRANSLATIONS[self.current_language]["open_hip"])
       self.ui_elements["open_hip_btn"] = self.open_hip_btn
@@ -1401,6 +1415,8 @@ class RenderManager(QWidget):
       self.ui_elements["scan_hint_label"].setText(t["scan_hint"])
       self.ui_elements["enable_all_btn"].setText(t["enable_all"])
       self.ui_elements["disable_all_btn"].setText(t["disable_all"])
+      self.ui_elements["move_up_btn"].setText(t["move_up"])
+      self.ui_elements["move_down_btn"].setText(t["move_down"])
       self.ui_elements["open_hip_btn"].setText(t["open_hip"])
       self.ui_elements["open_output_btn"].setText(t["open_output"])
       self.ui_elements["duplicate_btn"].setText(t["duplicate"])
@@ -1861,6 +1877,8 @@ class RenderManager(QWidget):
       menu.addAction(t["ctx_enable"], lambda: self._context_set_enabled(row, True))
       menu.addAction(t["ctx_disable"], lambda: self._context_set_enabled(row, False))
       menu.addAction(t["ctx_duplicate"], lambda: self.duplicate_queue_row(row))
+      menu.addAction(t["ctx_move_up"], lambda: self.move_queue_row_up(row))
+      menu.addAction(t["ctx_move_down"], lambda: self.move_queue_row_down(row))
       menu.addSeparator()
       menu.addAction(t["ctx_reset"], self.reset_rop)
       menu.addAction(t["ctx_remove"], self.remove_rop_from_queue)
@@ -2254,6 +2272,62 @@ class RenderManager(QWidget):
       set_disabled_style(self.stop_btn)
       self.update_start_button()
       self.save_state()
+
+  def _collect_queue_entries(self):
+      return [
+          self._queue_row_to_entry(row)
+          for row in range(self.queue_table.rowCount())
+      ]
+
+  def _restore_queue_entries(self, entries):
+      self.queue_table.blockSignals(True)
+      was_initialized = self.initialized
+      self.initialized = False
+      try:
+          self.queue_table.setRowCount(0)
+          for entry in entries:
+              row = self.queue_table.rowCount()
+              self.queue_table.insertRow(row)
+              self._populate_queue_row(row, entry=entry)
+      finally:
+          self.initialized = was_initialized
+          self.queue_table.blockSignals(False)
+      self.update_start_button()
+      self.on_queue_selection_changed()
+
+  def _move_queue_row(self, src_row, dest_row):
+      if self.queue_thread and self.queue_thread.isRunning():
+          self.log(TRANSLATIONS[self.current_language]["queue_reorder_blocked"])
+          return
+      count = self.queue_table.rowCount()
+      if src_row < 0 or src_row >= count:
+          return
+      dest_row = max(0, min(int(dest_row), count))
+      if src_row == dest_row or src_row + 1 == dest_row:
+          return
+      entries = self._collect_queue_entries()
+      entry = entries.pop(src_row)
+      if dest_row > src_row:
+          dest_row -= 1
+      entries.insert(dest_row, entry)
+      self._restore_queue_entries(entries)
+      self.queue_table.selectRow(dest_row)
+      if self.initialized:
+          self.save_state()
+
+  def move_queue_row_up(self, row=None):
+      if row is None:
+          row = self._get_selected_queue_row()
+      if row is None or row <= 0:
+          return
+      self._move_queue_row(row, row - 1)
+
+  def move_queue_row_down(self, row=None):
+      if row is None:
+          row = self._get_selected_queue_row()
+      if row is None or row >= self.queue_table.rowCount() - 1:
+          return
+      self._move_queue_row(row, row + 2)
 
   def _queue_row_to_entry(self, row):
       """Serialize one queue row for save/duplicate."""
