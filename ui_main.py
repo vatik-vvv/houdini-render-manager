@@ -551,6 +551,7 @@ class RenderQueueTable(QTableWidget):
       self.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
       self.parent_window = parent
       self.verticalHeader().setDefaultSectionSize(28)
+      self._drag_src_row = -1
 
   def data(self, index, role):
       if role == Qt.ItemDataRole.BackgroundRole and index.column() in (0, 6):
@@ -558,6 +559,23 @@ class RenderQueueTable(QTableWidget):
           if item:
               return item.background()
       return super().data(index, role)
+
+  def dropMimeData(self, row, column, data, action):
+      """Block Qt default InternalMove — it corrupts custom item roles/delegates."""
+      return False
+
+  def startDrag(self, supportedActions):
+      indexes = self.selectedIndexes()
+      self._drag_src_row = indexes[0].row() if indexes else -1
+      super().startDrag(supportedActions)
+
+  def _take_row_items(self, row):
+      return [self.takeItem(row, col) for col in range(self.columnCount())]
+
+  def _set_row_items(self, row, items):
+      for col, item in enumerate(items):
+          if item is not None:
+              self.setItem(row, col, item)
 
   def dragEnterEvent(self, event):
       if event.mimeData().hasFormat("application/x-qabstractitemmodeldatalist"):
@@ -567,43 +585,50 @@ class RenderQueueTable(QTableWidget):
       event.acceptProposedAction()
 
   def dropEvent(self, event):
-      if event.source() is not self:
-          event.ignore()
-          return
-      selected = self.selectedIndexes()
-      if not selected:
+      if not self._drag_source_is_self(event):
           event.ignore()
           return
 
-      src_row = selected[0].row()
-      drop_index = self.indexAt(event.position().toPoint())
-      dest_row = drop_index.row() if drop_index.isValid() else self.rowCount()
-      if dest_row > self.rowCount():
+      src_row = self._drag_src_row
+      if src_row < 0:
+          selected = self.selectedIndexes()
+          src_row = selected[0].row() if selected else -1
+      if src_row < 0 or src_row >= self.rowCount():
+          self._drag_src_row = -1
+          event.ignore()
+          return
+
+      drop_pos = event.position().toPoint()
+      drop_index = self.indexAt(drop_pos)
+      if drop_index.isValid():
+          dest_row = drop_index.row()
+          if drop_pos.y() > self.visualRect(drop_index).center().y():
+              dest_row += 1
+      else:
           dest_row = self.rowCount()
-      if src_row == dest_row or (src_row + 1 == dest_row and dest_row == self.rowCount()):
+
+      dest_row = max(0, min(dest_row, self.rowCount()))
+      if src_row == dest_row or src_row + 1 == dest_row:
+          self._drag_src_row = -1
           event.accept()
           return
 
-      parent = self.parent_window
-      if not parent or not hasattr(parent, "_queue_row_to_entry"):
-          event.ignore()
-          return
-
-      entry = parent._queue_row_to_entry(src_row)
-      self.blockSignals(True)
-      try:
-          self.removeRow(src_row)
-          if dest_row > src_row:
-              dest_row -= 1
-          self.insertRow(dest_row)
-          parent._populate_queue_row(dest_row, entry=entry)
-          self.selectRow(dest_row)
-      finally:
-          self.blockSignals(False)
-
+      items = self._take_row_items(src_row)
+      self.removeRow(src_row)
+      if dest_row > src_row:
+          dest_row -= 1
+      self.insertRow(dest_row)
+      self._set_row_items(dest_row, items)
+      self.selectRow(dest_row)
+      self._drag_src_row = -1
       event.accept()
-      if hasattr(self.parent_window, "save_state"):
+
+      if self.parent_window and hasattr(self.parent_window, "save_state"):
           self.parent_window.save_state()
+
+  def _drag_source_is_self(self, event):
+      src = event.source()
+      return src is self or src is self.viewport()
 
   def mousePressEvent(self, event):
       # Allow normal cell clicks and editing; deselect only when clicking empty area
