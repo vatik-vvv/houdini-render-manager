@@ -567,8 +567,41 @@ class RenderQueueTable(QTableWidget):
       event.acceptProposedAction()
 
   def dropEvent(self, event):
-      super().dropEvent(event)
-      # After drop, save state
+      if event.source() is not self:
+          event.ignore()
+          return
+      selected = self.selectedIndexes()
+      if not selected:
+          event.ignore()
+          return
+
+      src_row = selected[0].row()
+      drop_index = self.indexAt(event.position().toPoint())
+      dest_row = drop_index.row() if drop_index.isValid() else self.rowCount()
+      if dest_row > self.rowCount():
+          dest_row = self.rowCount()
+      if src_row == dest_row or (src_row + 1 == dest_row and dest_row == self.rowCount()):
+          event.accept()
+          return
+
+      parent = self.parent_window
+      if not parent or not hasattr(parent, "_queue_row_to_entry"):
+          event.ignore()
+          return
+
+      entry = parent._queue_row_to_entry(src_row)
+      self.blockSignals(True)
+      try:
+          self.removeRow(src_row)
+          if dest_row > src_row:
+              dest_row -= 1
+          self.insertRow(dest_row)
+          parent._populate_queue_row(dest_row, entry=entry)
+          self.selectRow(dest_row)
+      finally:
+          self.blockSignals(False)
+
+      event.accept()
       if hasattr(self.parent_window, "save_state"):
           self.parent_window.save_state()
 
@@ -749,7 +782,9 @@ class RenderManager(QWidget):
       self.queue_thread = None
       self._queue_cell_edit_guard = False
       self._resize_update_guard = False
-      
+      self._render_job_cur = 0
+      self._render_job_total = 0
+
       self.setWindowTitle(TRANSLATIONS[self.current_language]["title"])
       icon_path = app_icon_path()
       if os.path.exists(icon_path):
@@ -853,7 +888,7 @@ class RenderManager(QWidget):
       # --- Zone 3 ---
       group3 = QGroupBox(TRANSLATIONS[self.current_language]["zone3"])
       self.ui_elements["group3"] = group3
-      group3.setMaximumWidth(150)
+      group3.setMinimumWidth(200)
       zone3 = QHBoxLayout()
       self.scan_btn = QPushButton(TRANSLATIONS[self.current_language]["scan_hip"])
       self.ui_elements["scan_btn"] = self.scan_btn
@@ -2078,6 +2113,19 @@ class RenderManager(QWidget):
       self.queue_thread.finished_signal.connect(self.on_queue_finished)
       self.queue_thread.start()
 
+  def _format_running_status(self, ratio=None):
+      parts = []
+      if ratio is not None:
+          try:
+              parts.append(f"{int(float(ratio) * 100)}%")
+          except (TypeError, ValueError):
+              pass
+      if self._render_job_total > 0:
+          parts.append(f"{self._render_job_cur}/{self._render_job_total}")
+      if not parts:
+          return "Running"
+      return "Running " + " · ".join(parts)
+
   def _set_status_render_progress(self, row, ratio=None):
       status_item = self.queue_table.item(row, COL_STATUS)
       if not status_item:
@@ -2086,6 +2134,8 @@ class RenderManager(QWidget):
           status_item.setData(RENDER_PROGRESS_ROLE, None)
       else:
           status_item.setData(RENDER_PROGRESS_ROLE, float(ratio))
+          status_item.setText(self._format_running_status(ratio))
+          apply_status_style(status_item, "Running")
       self.queue_table.update(self.queue_table.model().index(row, COL_STATUS))
 
   def _clear_all_status_render_progress(self):
@@ -2099,6 +2149,8 @@ class RenderManager(QWidget):
       self._set_status_render_progress(row, ratio)
 
   def on_render_progress(self, cur, total, row):
+      self._render_job_cur = cur
+      self._render_job_total = total
       self._clear_all_status_render_progress()
       self._set_status_render_progress(row, 0.0)
       self._update_render_progress(cur, total, row, "Running")
@@ -2130,6 +2182,8 @@ class RenderManager(QWidget):
                   status_item.setText("Stopped")
                   apply_status_style(status_item, "Stopped")
           self._clear_all_status_render_progress()
+          self._render_job_cur = 0
+          self._render_job_total = 0
           self._update_render_progress(0, 0, 0, "")
           self.save_state()
       else:
@@ -2140,12 +2194,14 @@ class RenderManager(QWidget):
       self.update_start_button()
 
   def on_worker_update_row(self, row, status, start_time, end_time):
-      if status != "Running":
+      if status == "Running":
+          self._set_status_render_progress(row, 0.0)
+      else:
           self._set_status_render_progress(row, None)
-      status_item = self.queue_table.item(row, COL_STATUS)
-      if status_item:
-          status_item.setText(status)
-          apply_status_style(status_item, status)
+          status_item = self.queue_table.item(row, COL_STATUS)
+          if status_item:
+              status_item.setText(status)
+              apply_status_style(status_item, status)
       start_time_item = self.queue_table.item(row, 13)
       end_time_item = self.queue_table.item(row, 14)
       duration_item = self.queue_table.item(row, 15)
@@ -2166,6 +2222,8 @@ class RenderManager(QWidget):
       self.queue_thread = None
       self._render_jobs = []
       self._clear_all_status_render_progress()
+      self._render_job_cur = 0
+      self._render_job_total = 0
       self._update_render_progress(0, 0, 0, "")
       self.stop_btn.setEnabled(False)
       set_disabled_style(self.stop_btn)

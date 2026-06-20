@@ -33,10 +33,10 @@ python main.py
 ```powershell
 pip install pyinstaller
 python tools/build_app_icon.py   # multi-size .ico for Explorer / taskbar
-pyinstaller main.spec
+pyinstaller main.spec --distpath dist-build --workpath build-release
 ```
 
-Output: `dist/HoudiniRenderManager.exe`. Copy `config.example.json` to `dist/config.json` next to the exe.
+Output: `dist-build/HoudiniRenderManager.exe` (use `dist-build` so an active render in `dist/` is not blocked).
 
 ## Project layout
 

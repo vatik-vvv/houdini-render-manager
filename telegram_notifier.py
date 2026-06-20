@@ -7,6 +7,8 @@ import sys
 
 import requests
 
+from app_paths import config_path
+
 try:
     from PIL import Image
 except ImportError:
@@ -25,7 +27,7 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+CONFIG_FILE = config_path()
 
 DEFAULT_PREVIEW_MAX_SIDE = 2000
 PREVIEW_MIN_SIDE = 64

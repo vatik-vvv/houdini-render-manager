@@ -14,7 +14,9 @@ queue.json
 
 # PyInstaller
 build/
+build-release/
 dist/
+dist-build/
 
 # Portable GitHub CLI (tools/install_gh.ps1)
 tools/gh/
