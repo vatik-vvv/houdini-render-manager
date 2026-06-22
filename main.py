@@ -15,10 +15,14 @@ def ensure_files_exist():
                 "bot_token": "",
                 "chat_id": "",
                 "preview_max_side": 2000,
+                "send_mp4_on_complete": False,
+                "mp4_use_preview_max_side": True,
+                "mp4_max_side": 0,
             },
             "ui": {
                 "width": 1200,
                 "height": 800,
+                "log_position": "bottom",
             },
             "filters": {
                 "redshift": False,

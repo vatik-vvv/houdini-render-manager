@@ -83,7 +83,12 @@ class FramePreviewWatcher:
         return mtime <= base_mtime + 0.001
 
     def _should_send(self, frame):
-        return self.send2bot > 0 and frame % self.send2bot == 0
+        if self.send2bot <= 0:
+            return False
+        offset = frame - self.start_frame
+        if offset < 0:
+            return False
+        return offset % self.send2bot == 0
 
     def _frame_ready(self, frame):
         path = frame_output_path(self.output_path, frame, self.hip_file, self.op_name)

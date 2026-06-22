@@ -6,15 +6,17 @@ import os
 
 import subprocess
 
+import threading
+
 import time
-
-
 
 from frame_preview import FramePreviewWatcher
 
 from path_utils import (
 
     ensure_output_directory,
+
+    missing_render_frames,
 
     normalize_output_template,
 
@@ -23,22 +25,19 @@ from path_utils import (
 )
 
 from app_paths import config_path, hython_script_path
-from render_progress import progress_from_line
+from render_progress import work_progress_from_line, parse_redshift_rop_total_seconds
 
 from telegram_notifier import send_message
 
+from i18n import log_msg
 
-
-
-
-def _notify_telegram(message, log_callback=None):
+def _notify_telegram(message, log_callback=None, language="en"):
 
     ok, err = send_message(message)
 
     if not ok and log_callback and err:
 
-        log_callback(f"⚠️ Telegram: {err}")
-
+        log_callback(log_msg(language, "rr_tg_err", err=err))
 
 def _format_elapsed(seconds):
     total = int(max(0, round(seconds)))
@@ -47,7 +46,6 @@ def _format_elapsed(seconds):
     if hours:
         return f"{hours}:{minutes:02d}:{sec:02d}"
     return f"{minutes}:{sec:02d}"
-
 
 def _format_telegram_start(
     hip_path, rop, renderer, start_frame, end_frame, size_x, size_y, skip_existing_frames
@@ -63,7 +61,6 @@ def _format_telegram_start(
         f"skip existing: {skip_label}"
     )
 
-
 def _format_telegram_finish(hip_path, rop, duration_str):
     return (
         "✅ Finished render:\n"
@@ -72,19 +69,12 @@ def _format_telegram_finish(hip_path, rop, duration_str):
         f"Render time: {duration_str}"
     )
 
-
-
-
-
 logging.basicConfig(level=logging.INFO)
 
 logger = logging.getLogger(__name__)
 
-
-
 current_process = None
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-
 
 def get_hrender_path():
 
@@ -122,10 +112,6 @@ def get_hrender_path():
 
     return "hrender"
 
-
-
-
-
 def get_hython_path():
 
     cfg = config_path()
@@ -146,29 +132,91 @@ def get_hython_path():
 
     return ""
 
+def _resolve_work_total(scene, rop, start_frame, end_frame, output_path, skip_existing):
+    total = max(0, int(end_frame) - int(start_frame) + 1)
+    if not skip_existing or not output_path:
+        return total
+    try:
+        missing = missing_render_frames(output_path, start_frame, end_frame, scene, rop)
+        return len(missing)
+    except Exception:
+        return total
 
+def _handle_output_line(line, start_frame, end_frame, progress_callback, progress_state):
+    if not line:
+        return progress_state
+    stripped = line.strip()
+    if not stripped:
+        return progress_state
 
+    rs_total = parse_redshift_rop_total_seconds(stripped)
+    if rs_total is not None and rs_total > 0:
+        progress_state["pending_sec"] = rs_total
+        wt = int(progress_state.get("work_total") or 0)
+        if progress_callback and wt > 0:
+            done = int(progress_state.get("last_work_done", 0)) + 1
+            progress_callback(min(1.0, done / wt), done, wt, rs_total)
+            progress_state["last_work_done"] = done
+        return progress_state
 
+    if not progress_callback:
+        return progress_state
 
-def _handle_output_line(line, start_frame, end_frame, progress_callback, last_ratio):
+    wp = work_progress_from_line(stripped, start_frame, end_frame)
+    if wp is None:
+        return progress_state
+    ratio, done, total = wp
+    last_done = int(progress_state.get("last_work_done", 0))
+    if done > last_done:
+        frame_sec = progress_state.pop("pending_sec", None)
+        if not frame_sec or frame_sec <= 0:
+            frame_sec = -1.0
+        else:
+            frame_sec = float(frame_sec)
+        progress_callback(ratio, done, total, frame_sec)
+        progress_state["last_work_done"] = done
+        if total > 0:
+            progress_state["work_total"] = total
+    return progress_state
 
-    if not progress_callback or not line:
+def _consume_render_output(
+    process,
+    start_frame,
+    end_frame,
+    progress_callback,
+    progress_state,
+    log_callback,
+    preview_watcher,
+):
+    lock = threading.Lock()
 
-        return last_ratio
+    def on_line(raw_line):
+        line = raw_line.rstrip("\r\n")
+        if not line.strip():
+            return
+        logger.info(line)
+        if log_callback:
+            log_callback(f"   {line}")
+        nonlocal progress_state
+        with lock:
+            progress_state = _handle_output_line(
+                line, start_frame, end_frame, progress_callback, progress_state
+            )
+        if preview_watcher:
+            preview_watcher.poll()
 
-    ratio = progress_from_line(line, start_frame, end_frame)
+    def pump(pipe):
+        try:
+            for raw in iter(pipe.readline, ""):
+                on_line(raw)
+        finally:
+            pipe.close()
 
-    if ratio is not None and ratio >= last_ratio:
-
-        progress_callback(ratio)
-
-        return ratio
-
-    return last_ratio
-
-
-
-
+    stderr_thread = threading.Thread(target=pump, args=(process.stderr,), daemon=True)
+    stderr_thread.start()
+    pump(process.stdout)
+    stderr_thread.join()
+    return progress_state
 
 def _build_hython_render_cmd(
     hython_path, render_script, scene, rop, start_frame, end_frame, actual_x, actual_y, output_for_cmd, skip_existing_frames, resize_pct=100.0
@@ -217,10 +265,6 @@ def _build_hython_render_cmd(
 
     return cmd
 
-
-
-
-
 def _build_hrender_cmd(
 
     hrender_path, hython_path, scene, rop, start_frame, end_frame, actual_x, actual_y, output_for_cmd
@@ -230,8 +274,6 @@ def _build_hrender_cmd(
     hrender_basename = os.path.basename(hrender_path).lower()
 
     hrender_dir = os.path.dirname(hrender_path)
-
-
 
     if hrender_path.lower().endswith(".py"):
 
@@ -265,8 +307,6 @@ def _build_hrender_cmd(
 
         cmd = [hrender_path, "-e", "-f", str(start_frame), str(end_frame)]
 
-
-
     if rop:
 
         rop_path = rop if rop.startswith("/") else f"/out/{rop}"
@@ -288,10 +328,6 @@ def _build_hrender_cmd(
     cmd.append(scene)
 
     return cmd
-
-
-
-
 
 def run_render(
 
@@ -329,11 +365,11 @@ def run_render(
 
     render_height=None,
 
+    language="en",
+
 ):
 
     global current_process
-
-
 
     preview_watcher = None
 
@@ -361,9 +397,7 @@ def run_render(
 
         if log_callback:
 
-            log_callback(f"📤 Превью в Telegram: каждые {send2bot} кадр(а), по мере готовности файла")
-
-
+            log_callback(log_msg(language, "rr_preview_interval", send2bot=send2bot))
 
     try:
 
@@ -381,8 +415,6 @@ def run_render(
 
         scene = os.path.normpath(scene)
 
-
-
         message = _format_telegram_start(
             scene, rop, renderer, start_frame, end_frame, actual_x, actual_y, skip_existing_frames
         )
@@ -393,17 +425,21 @@ def run_render(
 
             log_callback(message)
 
-            log_callback(f"   Разрешение рендера: {actual_x}x{actual_y} (Resize {resize_pct:g}%)")
+            log_callback(
+                log_msg(
+                    language,
+                    "rr_resolution",
+                    actual_x=actual_x,
+                    actual_y=actual_y,
+                    resize_pct=resize_pct,
+                )
+            )
 
-        _notify_telegram(message, log_callback)
-
-
+        _notify_telegram(message, log_callback, language)
 
         if progress_callback:
-
-            progress_callback(0.0)
-
-
+            total_frames = max(0, int(end_frame) - int(start_frame) + 1)
+            progress_callback(0.0, 0, total_frames, -1.0)
 
         output_for_cmd = ""
 
@@ -412,8 +448,6 @@ def run_render(
             output_for_cmd = path_for_hrender(normalize_output_template(output_path.strip()))
 
             ensure_output_directory(output_for_cmd, scene, log_callback, op_name=rop)
-
-
 
         hython_path = os.path.normpath(get_hython_path())
 
@@ -458,7 +492,7 @@ def run_render(
 
             if log_callback and not skip_existing_frames:
 
-                log_callback("   Принудительный рендер всех кадров (Skip в очереди выключен)")
+                log_callback(log_msg(language, "rr_force_all_frames"))
 
         else:
 
@@ -486,23 +520,13 @@ def run_render(
 
             if log_callback and not skip_existing_frames:
 
-                log_callback(
-
-                    "⚠️ hython/render_rop.py недоступен — пропуск существующих кадров "
-
-                    "задаётся только параметрами ROP в HIP"
-
-                )
-
-
+                log_callback(log_msg(language, "rr_hython_unavailable"))
 
         logger.info(f"Running command: {' '.join(cmd)}")
 
         if log_callback:
 
-            log_callback(f"📝 Команда: {' '.join(cmd)}")
-
-
+            log_callback(log_msg(language, "rr_command", cmd=" ".join(cmd)))
 
         popen_kw = {
             "stdout": subprocess.PIPE,
@@ -515,79 +539,42 @@ def run_render(
 
         current_process = subprocess.Popen(cmd, **popen_kw)
 
+        progress_state = {
+            "last_work_done": 0,
+            "pending_sec": None,
+            "work_total": _resolve_work_total(
+                scene, rop, start_frame, end_frame, output_path, skip_existing_frames
+            ),
+        }
 
-
-        last_ratio = 0.0
-
-        while True:
-
-            output_line = current_process.stdout.readline()
-
-            if output_line == "" and current_process.poll() is not None:
-
-                break
-
-            if output_line:
-
-                line = output_line.strip()
-
-                if line:
-
-                    logger.info(line)
-
-                    if log_callback:
-
-                        log_callback(f"   {line}")
-
-                    last_ratio = _handle_output_line(
-
-                        line, start_frame, end_frame, progress_callback, last_ratio
-
-                    )
-
-            if preview_watcher:
-
-                preview_watcher.poll()
-
-
-
-        stderr_output = current_process.stderr.read()
-
-        if stderr_output:
-
-            logger.error(f"Stderr: {stderr_output}")
-
-            if log_callback:
-
-                log_callback(f"⚠️ Stderr: {stderr_output}")
-
-            for line in stderr_output.splitlines():
-
-                last_ratio = _handle_output_line(
-
-                    line.strip(), start_frame, end_frame, progress_callback, last_ratio
-
-                )
-
-
+        progress_state = _consume_render_output(
+            current_process,
+            start_frame,
+            end_frame,
+            progress_callback,
+            progress_state,
+            log_callback,
+            preview_watcher,
+        )
 
         retcode = current_process.wait()
 
         current_process = None
 
-
-
         if preview_watcher:
 
             preview_watcher.flush()
 
-
-
         if progress_callback:
-
-            progress_callback(1.0 if retcode == 0 else last_ratio)
-
-
+            total_frames = max(0, int(end_frame) - int(start_frame) + 1)
+            last_done = progress_state.get("last_work_done", 0)
+            if retcode == 0:
+                done = last_done if last_done > 0 else total_frames
+                progress_callback(1.0, done, done, -1.0)
+            elif total_frames > 0:
+                progress_callback(last_done / total_frames, last_done, total_frames, -1.0)
+            else:
+                progress_callback(0.0, 0, 0, -1.0)
 
         if retcode == 0:
 
@@ -601,7 +588,7 @@ def run_render(
 
                 log_callback(message)
 
-            _notify_telegram(message, log_callback)
+            _notify_telegram(message, log_callback, language)
 
         else:
 
@@ -613,9 +600,7 @@ def run_render(
 
                 log_callback(message)
 
-            _notify_telegram(message, log_callback)
-
-
+            _notify_telegram(message, log_callback, language)
 
     except subprocess.CalledProcessError as e:
 
@@ -627,7 +612,7 @@ def run_render(
 
             log_callback(f"❌ {message}")
 
-        _notify_telegram(f"❌ Failed render: {scene}, ROP={rop}. Error: {e.stderr}", log_callback)
+        _notify_telegram(f"❌ Failed render: {scene}, ROP={rop}. Error: {e.stderr}", log_callback, language)
 
     except Exception as e:
 
@@ -639,15 +624,11 @@ def run_render(
 
             log_callback(f"❌ {message}")
 
-        _notify_telegram(f"❌ Error: {e}", log_callback)
+        _notify_telegram(f"❌ Error: {e}", log_callback, language)
 
     finally:
 
         current_process = None
-
-
-
-
 
 def stop_render():
 
@@ -680,5 +661,4 @@ def stop_render():
                 return False
 
     return False
-
 

@@ -1,4 +1,5 @@
 """Houdini-style path helpers for queue and render."""
+import glob
 import os
 import re
 
@@ -126,3 +127,109 @@ def path_tooltip(raw_path, hip_file=None, op_name=None):
             lines.append(f"frame 1: {example}")
         return "\n".join(lines)
     return raw_path
+
+
+def frame_file_exists(path):
+    """True if path is a non-empty file."""
+    try:
+        return bool(path) and os.path.isfile(path) and os.path.getsize(path) > 0
+    except OSError:
+        return False
+
+
+def output_template_for_frames(output_path):
+    """Normalize output path for per-frame existence checks."""
+    if not output_path:
+        return ""
+    return normalize_output_template(output_path.strip())
+
+
+def _glob_frame_map(template, start_frame, end_frame, hip_file=None, op_name=None):
+    """Map frame numbers to paths by globbing the sequence pattern."""
+    glob_path = resolve_houdini_vars(template, hip_file, op_name)
+    glob_path = re.sub(r"\$F(\d+)", "*", glob_path)
+    glob_path = re.sub(r"\$F\b", "*", glob_path)
+    glob_path = re.sub(r"%0(\d+)d", "*", glob_path)
+    glob_path = glob_path.replace("#", "*")
+    directory = os.path.dirname(glob_path) or "."
+    if not os.path.isdir(directory):
+        return {}
+    found = {}
+    for file_path in sorted(glob.glob(glob_path)):
+        frame_match = re.search(r"(\d+)(?=[^\d]*$)", file_path)
+        if not frame_match:
+            continue
+        frame = int(frame_match.group(1))
+        if start_frame <= frame <= end_frame:
+            found[frame] = os.path.normpath(file_path)
+    return found
+
+
+def resolve_render_frames_on_disk(
+    output_path, start_frame, end_frame, hip_file=None, op_name=None
+):
+    """
+    Return {frame_number: file_path} for frames present on disk in [start, end].
+    Requires a frame sequence pattern ($F4, ####, etc.). Returns partial map if
+    only some frames exist.
+    """
+    if not output_path or end_frame < start_frame:
+        return {}
+
+    template = output_template_for_frames(output_path)
+    if not has_frame_tokens(template):
+        return {}
+
+    total = end_frame - start_frame + 1
+    found = {}
+    path_owner = {}
+
+    for frame in range(start_frame, end_frame + 1):
+        path = expand_frame_in_path(template, frame, hip_file, op_name)
+        key = norm_path_key(path)
+        if key in path_owner and path_owner[key] != frame:
+            # e.g. literal beauty.0001.exr without $F — same file for every frame
+            if total > 1:
+                return {}
+            break
+        path_owner[key] = frame
+        if frame_file_exists(path):
+            found[frame] = path
+
+    if len(found) >= total:
+        return found
+
+    for frame, path in _glob_frame_map(
+        template, start_frame, end_frame, hip_file, op_name
+    ).items():
+        if frame not in found and frame_file_exists(path):
+            found[frame] = path
+    return found
+
+
+def missing_render_frames(output_path, start_frame, end_frame, hip_file=None, op_name=None):
+    """Frame numbers in range that are not present on disk. Empty = all there."""
+    expected = set(range(start_frame, end_frame + 1))
+    found = resolve_render_frames_on_disk(
+        output_path, start_frame, end_frame, hip_file, op_name
+    )
+    return sorted(expected - set(found.keys()))
+
+
+def all_render_frames_exist(output_path, start_frame, end_frame, hip_file=None, op_name=None):
+    """True only when every frame in the range has a non-empty file on disk."""
+    if not output_path:
+        return False
+    template = output_template_for_frames(output_path)
+    if not has_frame_tokens(template):
+        return False
+    return len(missing_render_frames(
+        output_path, start_frame, end_frame, hip_file, op_name
+    )) == 0
+
+
+def count_render_frames_on_disk(output_path, start_frame, end_frame, hip_file=None, op_name=None):
+    """How many frames in [start, end] exist on disk."""
+    return len(resolve_render_frames_on_disk(
+        output_path, start_frame, end_frame, hip_file, op_name
+    ))

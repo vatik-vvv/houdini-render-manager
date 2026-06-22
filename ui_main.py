@@ -1,56 +1,71 @@
-# -*- coding: utf-8 -*-
-import glob, os, json, re, subprocess, requests, sys
-from datetime import datetime
+import os, json, re, subprocess, requests, sys, time
+from datetime import datetime, timedelta
 from render_runner import run_render, stop_render
-from telegram_notifier import send_image
-from app_paths import config_path, bundled_script, app_icon_path, find_bundled_file, hython_script_path
+from telegram_notifier import send_image, send_video, get_mp4_max_side, test_bot_connection, send_message, reload_config
+from app_paths import config_path, app_icon_path, find_bundled_file, hython_script_path
+from queue_model import (
+    RenderQueueModel,
+    RenderQueueView,
+    QUEUE_COLUMN_KEYS,
+    COL_HIP,
+    COL_ROP,
+    COL_OUTPUT,
+    COL_STATUS,
+    COL_START_TIME,
+    COL_END_TIME,
+    COL_DURATION,
+    COL_ETA,
+    COL_SEND2BOT,
+    COL_SEND_MP4,
+    FULL_PATH_ROLE,
+    RENDER_PROGRESS_ROLE,
+    BASE_SIZE_X_ROLE,
+    BASE_SIZE_Y_ROLE,
+    normalize_toggle_value,
+    is_toggle_checked_value,
+    _empty_row,
+)
+from ui_theme import apply_dark_theme, TOGGLE_ON_COLOR, TOGGLE_OFF_COLOR
 from path_utils import (
     norm_path_key,
     resolve_houdini_vars,
     expand_frame_in_path,
     normalize_output_template,
     path_tooltip,
+    missing_render_frames,
 )
+from i18n import log_msg
 from PySide6.QtWidgets import (
       QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QListWidget, QComboBox,
       QFileDialog, QLabel, QDialog, QLineEdit, QTableWidget, QTableWidgetItem,
       QTextEdit, QCheckBox, QGroupBox, QApplication, QAbstractItemView, QSplitter,
-      QSplitterHandle, QHeaderView,
+      QSplitterHandle, QHeaderView, QScrollArea,
       QSizePolicy, QStyledItemDelegate, QStyle, QStyleOptionButton, QStyleOptionViewItem,
-      QMessageBox, QMenu, QLineEdit, QSpinBox
+      QMessageBox, QMenu, QLineEdit, QSpinBox, QProgressBar
   )
 from PySide6.QtGui import QPalette, QColor, QIcon, QFont, QPainter, QPen, QPixmap
-from PySide6.QtCore import Qt, QByteArray, QMimeData, QThread, Signal, QEvent, QRect, QSize
+from PySide6.QtCore import Qt, QByteArray, QMimeData, QThread, Signal, QEvent, QRect, QSize, QTimer
 
 CONFIG_FILE = config_path()
 HEADER_LOGO_HEIGHT_PX = 27
-TOGGLE_ON_COLOR = QColor(76, 175, 80)
-TOGGLE_OFF_COLOR = QColor(211, 47, 47)
-QUEUE_COLUMN_KEYS = [
-    "enabled", "hip", "rop", "type", "start_frame", "end_frame", "skip",
-    "size_x", "size_y", "resize", "output_path", "status", "send2bot",
-    "start_time", "end_time", "duration",
-]
-COL_HIP, COL_ROP, COL_OUTPUT, COL_STATUS = 1, 2, 10, 11
-FULL_PATH_ROLE = Qt.ItemDataRole.UserRole
-RENDER_PROGRESS_ROLE = Qt.ItemDataRole.UserRole + 2
-BASE_SIZE_X_ROLE = Qt.ItemDataRole.UserRole + 3
-BASE_SIZE_Y_ROLE = Qt.ItemDataRole.UserRole + 4
-STATUS_STYLES = {
-    "Queued": (QColor(70, 70, 70), QColor(220, 220, 220)),
-    "Running": (QColor(0, 120, 200), QColor(255, 255, 255)),
-    "Completed": (QColor(46, 125, 50), QColor(255, 255, 255)),
-    "Failed": (QColor(183, 28, 28), QColor(255, 255, 255)),
-    "Skipped": (QColor(100, 100, 100), QColor(200, 200, 200)),
-    "Stopped": (QColor(150, 100, 0), QColor(255, 255, 255)),
-}
+ZONE3_FIXED_WIDTH = 200
 
 
-def resource_path(relative_path):
-    base_path = getattr(sys, '_MEIPASS', os.path.abspath(os.path.dirname(__file__)))
-    return os.path.join(base_path, relative_path)
+def _horizontal_button_bar(layout, height=34):
+    """Button row that scrolls horizontally instead of blocking window resize."""
+    bar = QWidget()
+    bar.setLayout(layout)
+    scroll = QScrollArea()
+    scroll.setWidget(bar)
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    scroll.setFixedHeight(height)
+    scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+    return scroll
 
-# Translation dictionary
+
 TRANSLATIONS = {
     "en": {
         "title": "Houdini Render Manager",
@@ -82,7 +97,8 @@ TRANSLATIONS = {
         "reset_rop": "Reset ROP",
         "remove_rop": "Remove ROP",
         "clear_log": "Clear log",
-        "queue_headers": ["Enabled","HIP","ROP","Type","Start","End","Skip","Size X","Size Y","Resize","Output","Status","Send2Bot every","Start Time","End Time","Duration"],
+        "queue_headers": ["Enabled","HIP","ROP","Type","Start","End","Skip","Size X","Size Y","Resize","Output","Status","Jpg-TG","MP4-TG","Start Time","End Time","Duration","Estimated finish"],
+        "eta_finish_tip": "Remaining: {remaining}\nEstimated finish: {finish} (local)",
         "bot_token": "Bot Token:",
         "chat_id": "Chat ID:",
         "save": "Save",
@@ -90,9 +106,43 @@ TRANSLATIONS = {
         "send_test": "Send Test Message",
         "tg_saved": "Telegram settings saved.",
         "tg_preview_max": "Preview max side (px):",
-        "tg_preview_hint": "Frames are converted to JPEG and resized (longest side). Supports PNG, JPG, TIF, EXR.",
-        "render_progress_idle": "",
-        "render_progress": "Render {cur}/{total}: {hip} → {rop} [{status}]",
+        "tg_preview_hint": "Frame previews: JPEG, longest side limited above. Formats: PNG, JPG, TIF, EXR.",
+        "tg_dialog_title": "Telegram notifications",
+        "tg_mp4_on_complete": "Default Send MP4 for new queue rows (can change per row in queue)",
+        "tg_mp4_max_side": "MP4 max side (px, 0 = use image preview size):",
+        "tg_mp4_use_preview": "MP4 uses same max side as image previews",
+        "tg_instructions_html": (
+            "<p><b style='color:#7ec8e8'>1. Create a bot</b></p>"
+            "<ol style='margin-top:4px;margin-bottom:8px;padding-left:22px'>"
+            "<li>Open Telegram and message <b>@BotFather</b>.</li>"
+            "<li>Send <code>/newbot</code>, choose a name and username (must end with <code>bot</code>).</li>"
+            "<li>Copy the <b>HTTP API token</b> — paste it below.</li>"
+            "</ol>"
+            "<p><b style='color:#7ec8e8'>2. Get your chat ID</b></p>"
+            "<ol style='margin-top:4px;margin-bottom:4px;padding-left:22px'>"
+            "<li>Open your bot in Telegram and tap <b>Start</b>.</li>"
+            "<li>Message <b>@GetId</b> and tap <b>Start</b> — copy the numeric <b>Chat ID</b>.</li>"
+            "<li>Paste that ID below (groups often use negative IDs).</li>"
+            "</ol>"
+            "<p style='color:#a0a8b0;margin-top:8px'>Group: add <b>@GetId</b> to the group. "
+            "Alternative: open <code>getUpdates</code> in a browser after messaging your bot.</p>"
+        ),
+        "workflow_html": (
+            "<b style='color:#7ec8e8'>Workflow</b> &nbsp;"
+            "① Set <b>hython</b> path &nbsp;→&nbsp; "
+            "② Add <b>HIP</b> files &nbsp;→&nbsp; "
+            "③ <b>Scan</b> selected HIP &nbsp;→&nbsp; "
+            "④ Pick <b>ROPs</b> → Add to queue &nbsp;→&nbsp; "
+            "⑤ <b>Start Render</b> &nbsp;|&nbsp; "
+            "Drag rows or <b>Up/Down</b> to reorder &nbsp;|&nbsp; "
+            "Telegram: frame previews (Send2Bot) + optional MP4 on finish"
+        ),
+        "zone2_tip": "Add .hip files (drag-and-drop supported). Select one file, then scan.",
+        "zone3_tip": "Scan the selected HIP for render nodes (ROPs).",
+        "zone4_tip": "Filter ROPs, multi-select, add to the render queue below.",
+        "zone5_tip": "Render queue — edit frames, paths, resize. Status shows job progress.",
+        "render_progress_idle": "Render progress: idle",
+        "render_progress": "Job {cur}/{total}: {hip} → {rop} — {status} ({pct}%)",
         "enable_all": "Enable all",
         "disable_all": "Disable all",
         "open_hip": "Open HIP",
@@ -118,6 +168,10 @@ TRANSLATIONS = {
         "ctx_open_output": "Open output folder",
         "path_empty": "Output path is empty — set it in the queue or rescan the ROP.",
         "splitter_queue_resize": "Drag to resize the render queue height (zone 5)",
+        "splitter_zones_resize": "Drag to resize HIP list (zone 2) and ROP list (zone 4)",
+        "log_position_bottom": "Log: bottom",
+        "log_position_right": "Log: right",
+        "log_position_tip": "Toggle log panel position (bottom or right side)",
     },
     "ru": {
         "title": "Менеджер рендера Houdini",
@@ -149,7 +203,9 @@ TRANSLATIONS = {
         "reset_rop": "Сбросить ROP",
         "remove_rop": "Удалить ROP",
         "clear_log": "Очистить лог",
-        "queue_headers": ["Вкл.","HIP","ROP","Тип","Начало","Конец","Пропуск","Размер X","Размер Y","Масштаб","Путь вывода","Статус","Send2Bot every","Время начала","Время окончания","Длительность"],
+        "queue_headers": ["Вкл.","HIP","ROP","Тип","Начало","Конец","Пропуск","Размер X","Размер Y","Масштаб","Путь вывода","Статус","Jpg-TG","MP4-TG","Время начала","Время окончания","Длительность","Окончание ~"],
+        "tg_mp4_on_complete": "MP4 для новых строк очереди по умолчанию (в очереди можно изменить)",
+        "eta_finish_tip": "Осталось: {remaining}\nПримерное окончание: {finish} (локальное)",
         "bot_token": "Токен бота:",
         "chat_id": "ID чата:",
         "save": "Сохранить",
@@ -158,8 +214,41 @@ TRANSLATIONS = {
         "tg_saved": "Настройки Telegram сохранены.",
         "tg_preview_max": "Макс. сторона превью (px):",
         "tg_preview_hint": "Кадры конвертируются в JPEG с уменьшением (длинная сторона). Форматы: PNG, JPG, TIF, EXR.",
-        "render_progress_idle": "",
-        "render_progress": "Рендер {cur}/{total}: {hip} → {rop} [{status}]",
+        "tg_dialog_title": "Уведомления Telegram",
+        "tg_mp4_max_side": "MP4 макс. сторона (px, 0 = как у картинок):",
+        "tg_mp4_use_preview": "MP4 — тот же лимит, что и для JPEG превью",
+        "tg_instructions_html": (
+            "<p><b style='color:#7ec8e8'>1. Создайте бота</b></p>"
+            "<ol style='margin-top:4px;margin-bottom:8px;padding-left:22px'>"
+            "<li>В Telegram напишите <b>@BotFather</b>.</li>"
+            "<li>Команда <code>/newbot</code>, имя и username (оканчивается на <code>bot</code>).</li>"
+            "<li>Скопируйте <b>HTTP API token</b> — вставьте ниже.</li>"
+            "</ol>"
+            "<p><b style='color:#7ec8e8'>2. Узнайте chat ID</b></p>"
+            "<ol style='margin-top:4px;margin-bottom:4px;padding-left:22px'>"
+            "<li>Откройте бота и нажмите <b>Start</b>.</li>"
+            "<li>Напишите <b>@GetId</b> → <b>Start</b> — скопируйте <b>Chat ID</b>.</li>"
+            "<li>Вставьте ID ниже (для групп ID часто отрицательный).</li>"
+            "</ol>"
+            "<p style='color:#a0a8b0;margin-top:8px'>Группа: добавьте <b>@GetId</b> в чат. "
+            "Или <code>getUpdates</code> в браузере после сообщения боту.</p>"
+        ),
+        "workflow_html": (
+            "<b style='color:#7ec8e8'>Порядок работы</b> &nbsp;"
+            "① Путь к <b>hython</b> &nbsp;→&nbsp; "
+            "② <b>HIP</b> файлы &nbsp;→&nbsp; "
+            "③ <b>Скан</b> HIP &nbsp;→&nbsp; "
+            "④ <b>ROP</b> → в очередь &nbsp;→&nbsp; "
+            "⑤ <b>Старт рендера</b> &nbsp;|&nbsp; "
+            "Перетаскивание или <b>Выше/Ниже</b> &nbsp;|&nbsp; "
+            "Telegram: кадры (Send2Bot) + MP4 по завершении"
+        ),
+        "zone2_tip": "Добавьте .hip (можно перетащить). Выберите файл для скана.",
+        "zone3_tip": "Скан выбранного HIP на ROP узлы.",
+        "zone4_tip": "Фильтр ROP, выбор, добавление в очередь.",
+        "zone5_tip": "Очередь рендера — кадры, пути, resize. Статус — прогресс.",
+        "render_progress_idle": "Прогресс рендера: ожидание",
+        "render_progress": "Задача {cur}/{total}: {hip} → {rop} — {status} ({pct}%)",
         "enable_all": "Включить все",
         "disable_all": "Выключить все",
         "open_hip": "Открыть HIP",
@@ -185,6 +274,10 @@ TRANSLATIONS = {
         "ctx_open_output": "Папка вывода",
         "path_empty": "Путь вывода пуст — укажите в очереди или пересканируйте ROP.",
         "splitter_queue_resize": "Потяните разделитель, чтобы изменить высоту очереди рендера (зона 5)",
+        "splitter_zones_resize": "Потяните разделитель, чтобы изменить ширину зон 2 (HIP) и 4 (ROP)",
+        "log_position_bottom": "Лог: снизу",
+        "log_position_right": "Лог: справа",
+        "log_position_tip": "Переключить положение панели лога (снизу или справа)",
     }
 }
 
@@ -230,14 +323,14 @@ class GripSplitterHandle(QSplitterHandle):
                 h = self.FLAT_HEIGHT
             else:
                 h = self.NORMAL_HEIGHT
-            return QSize(max(self.width(), 80), h)
+            return QSize(0, h)
         if self._style == self.STYLE_QUEUE:
             w = self.QUEUE_HEIGHT
         elif self._style == self.STYLE_FLAT:
             w = self.FLAT_HEIGHT
         else:
             w = self.NORMAL_HEIGHT
-        return QSize(w, max(self.height(), 80))
+        return QSize(w, 0)
 
     def paintEvent(self, event):
         p = QPainter(self)
@@ -264,9 +357,11 @@ class GripSplitterHandle(QSplitterHandle):
 
 
 class MainSplitter(QSplitter):
-    """Render queue (zone 5) resizable via grips above and below it."""
+    """Splitter with optional queue resize grips on selected handle indexes."""
 
-    QUEUE_HANDLE_INDEXES = (0, 1)
+    def __init__(self, orientation, parent=None, queue_handle_indexes=(0, 1)):
+        super().__init__(orientation, parent)
+        self._queue_handle_indexes = tuple(queue_handle_indexes)
 
     def createHandle(self):
         return GripSplitterHandle(self.orientation(), self)
@@ -276,22 +371,15 @@ class MainSplitter(QSplitter):
             handle = self.handle(idx)
             if handle is None or not isinstance(handle, GripSplitterHandle):
                 continue
-            if idx in self.QUEUE_HANDLE_INDEXES:
+            if idx in self._queue_handle_indexes:
                 handle.set_style(GripSplitterHandle.STYLE_QUEUE)
                 handle.setEnabled(True)
                 if queue_tooltip:
                     handle.setToolTip(queue_tooltip)
             else:
                 handle.set_style(GripSplitterHandle.STYLE_NORMAL)
-
-
-def apply_status_style(item, status):
-    if item is None:
-        return
-    colors = STATUS_STYLES.get(status)
-    if colors:
-        item.setBackground(colors[0])
-        item.setForeground(colors[1])
+                if queue_tooltip:
+                    handle.setToolTip(queue_tooltip)
 
 
 def format_duration_hms(start_s, end_s):
@@ -311,100 +399,40 @@ def format_duration_hms(start_s, end_s):
     except ValueError:
         return "--"
 
-def apply_dark_theme(widget):
-    """Apply dark theme with hard-coded colors"""
-    stylesheet = """
-    QWidget, QMainWindow, QDialog {
-        background-color: #353535;
-        color: #ffffff;
-    }
-    QLineEdit, QTextEdit, QListWidget, QTableWidget, QComboBox {
-        background-color: #191919;
-        color: #ffffff;
-        border: 1px solid #555555;
-    }
-    QPushButton {
-        background-color: #353535;
-        color: #ffffff;
-        border: 1px solid #555555;
-        padding: 5px;
-        border-radius: 3px;
-    }
-    QPushButton:hover {
-        background-color: #454545;
-    }
-    QPushButton:pressed {
-        background-color: #252525;
-    }
-    QGroupBox {
-        color: #ffffff;
-        border: 1px solid #555555;
-        border-radius: 5px;
-        margin-top: 10px;
-        padding-top: 10px;
-    }
-    QGroupBox::title {
-        subcontrol-origin: margin;
-        left: 10px;
-        padding: 0 3px 0 3px;
-    }
-    QLabel {
-        color: #ffffff;
-    }
-    QLabel#appTitleLabel {
-        font-size: 17px;
-        font-weight: bold;
-        letter-spacing: 2px;
-        color: #e8e8e8;
-    }
-    QCheckBox {
-        color: #ffffff;
-    }
-    QCheckBox::indicator {
-        background-color: #191919;
-        border: 1px solid #555555;
-    }
-    QCheckBox::indicator:checked {
-        background-color: #8e2dc5;
-    }
-    QHeaderView::section {
-        background-color: #353535;
-        color: #ffffff;
-        padding: 5px;
-        border: 1px solid #555555;
-    }
-    QListWidget::item:selected {
-        background-color: #5a4a72;
-        color: #ffffff;
-        border: 1px solid #8e2dc5;
-    }
-    QTableWidget::item:selected {
-        background-color: #5a4a72;
-        color: #ffffff;
-        border: 1px solid #8e2dc5;
-    }
-    QTableWidget {
-        gridline-color: #404040;
-        alternate-background-color: #1e1e1e;
-    }
-    QTableWidget::item {
-        padding: 2px 6px;
-    }
-    QSplitter::handle:vertical {
-        background: #3a3a3a;
-    }
-    QSplitter::handle:vertical:hover {
-        background: #4a4a4a;
-    }
-    """
-    widget.setStyleSheet(stylesheet)
+
+def format_eta_finish_cell(seconds):
+    """Compact estimated finish clock for the Estimated finish column."""
+    if seconds is None or seconds <= 0:
+        return "--"
+    dt = datetime.now() + timedelta(seconds=int(round(seconds)))
+    now = datetime.now()
+    if dt.date() == now.date():
+        return dt.strftime("%H:%M")
+    if dt.year == now.year:
+        return dt.strftime("%d.%m %H:%M")
+    return dt.strftime("%d.%m.%y %H:%M")
 
 
-def normalize_toggle_value(raw_val, default="0"):
-    if raw_val is None or raw_val == "":
-        return default
-    s = str(raw_val).lower()
-    return "1" if s in ("true", "1", "yes") else "0"
+def format_remaining_seconds(seconds):
+    if seconds is None or seconds <= 0:
+        return "--"
+    total = int(round(seconds))
+    if total < 60:
+        return f"~{total}s"
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h >= 24:
+        d, h = divmod(h, 24)
+        return f"~{d}d {h}:{m:02d}:{s:02d}"
+    if h:
+        return f"~{h}:{m:02d}:{s:02d}"
+    return f"~{m}:{s:02d}"
+
+
+def finish_clock_from_now(seconds):
+    if seconds is None or seconds <= 0:
+        return ""
+    return (datetime.now() + timedelta(seconds=seconds)).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def is_toggle_checked(item):
@@ -442,10 +470,9 @@ class FullPathEditDelegate(QStyledItemDelegate):
         return editor
 
     def setEditorData(self, editor, index):
-        item = self.table.item(index.row(), index.column())
-        if item:
-            full = item.data(FULL_PATH_ROLE)
-            editor.setText(str(full).strip() if full else item.text())
+        full = index.data(FULL_PATH_ROLE)
+        display = index.data(Qt.ItemDataRole.DisplayRole)
+        editor.setText(str(full).strip() if full else (display or ""))
 
     def setModelData(self, editor, model, index):
         path = editor.text().strip()
@@ -465,12 +492,11 @@ class StatusProgressDelegate(QStyledItemDelegate):
 
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
-        table = opt.widget
-        item = table.item(index.row(), index.column()) if table else None
 
         rect = opt.rect
-        if item:
-            painter.fillRect(rect, item.background())
+        bg = index.data(Qt.ItemDataRole.BackgroundRole)
+        if bg:
+            painter.fillRect(rect, bg)
         else:
             style = opt.widget.style() if opt.widget else QApplication.style()
             style.drawPrimitive(QStyle.PrimitiveElement.PE_PanelItemViewItem, opt, painter, opt.widget)
@@ -491,13 +517,13 @@ class ToggleCheckBoxDelegate(QStyledItemDelegate):
         self.on_toggled = on_toggled
 
     def paint(self, painter, option, index):
-        item = self.table.item(index.row(), index.column())
-        if item:
-            painter.fillRect(option.rect, item.background())
+        bg = index.data(Qt.ItemDataRole.BackgroundRole)
+        if bg:
+            painter.fillRect(option.rect, bg)
         style = option.widget.style() if option.widget else QApplication.style()
         checkbox_opt = QStyleOptionButton()
         checkbox_opt.state = QStyle.StateFlag.State_Enabled
-        if item and is_toggle_checked(item):
+        if is_toggle_checked_value(index.data(Qt.ItemDataRole.UserRole)):
             checkbox_opt.state |= QStyle.StateFlag.State_On
         indicator_size = style.pixelMetric(QStyle.PixelMetric.PM_IndicatorWidth, checkbox_opt, option.widget)
         checkbox_opt.rect = QRect(
@@ -510,12 +536,11 @@ class ToggleCheckBoxDelegate(QStyledItemDelegate):
 
     def editorEvent(self, event, model, option, index):
         if event.type() == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
-            item = self.table.item(index.row(), index.column())
-            if item:
-                apply_toggle_cell_style(item, not is_toggle_checked(item))
-                if self.on_toggled:
-                    self.on_toggled()
-                return True
+            checked = is_toggle_checked_value(index.data(Qt.ItemDataRole.UserRole))
+            model.setData(index, "0" if checked else "1", Qt.ItemDataRole.UserRole)
+            if self.on_toggled:
+                self.on_toggled()
+            return True
         return False
 
 def set_disabled_style(btn):
@@ -530,10 +555,21 @@ def set_delete_style(btn):
 def set_reset_style(btn):
   btn.setStyleSheet("QPushButton:enabled { background-color: #00BFFF; color: #fff; }")
 
-class HipList(QListWidget):
+
+class CompactListWidget(QListWidget):
+    """List that scrolls instead of forcing window height from item count."""
+
+    def minimumSizeHint(self):
+        h = max(24, self.fontMetrics().height() * 2 + 4)
+        return QSize(0, h)
+
+
+class HipList(CompactListWidget):
   def __init__(self, parent=None):
       super().__init__(parent)
       self.setAcceptDrops(True)
+      self.setMinimumSize(0, 0)
+      self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
       self.setSelectionMode(QAbstractItemView.ExtendedSelection)
       self.setAlternatingRowColors(True)
 
@@ -557,224 +593,203 @@ class HipList(QListWidget):
           if hasattr(parent, "save_state"):
               parent.save_state()
 
-class RenderQueueTable(QTableWidget):
-  """Queue table — custom row reorder (Qt InternalMove corrupts custom cell data)."""
-
-  def __init__(self, parent=None):
-      super().__init__(parent)
-      self.setDragDropMode(QAbstractItemView.DragDropMode.NoDragDrop)
-      self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-      self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-      self.setAlternatingRowColors(True)
-      self.setShowGrid(True)
-      self.setEditTriggers(
-          QAbstractItemView.EditTrigger.DoubleClicked
-          | QAbstractItemView.EditTrigger.EditKeyPressed
-      )
-      self.parent_window = parent
-      self.verticalHeader().setVisible(False)
-      self.verticalHeader().setDefaultSectionSize(28)
-      self._press_row = -1
-      self._press_pos = None
-      self._dragging = False
-      self.setMouseTracking(True)
-
-  def data(self, index, role):
-      if role == Qt.ItemDataRole.BackgroundRole and index.column() in (0, 6):
-          item = self.item(index.row(), index.column())
-          if item:
-              return item.background()
-      return super().data(index, role)
-
-  def _insert_index_at(self, pos):
-      idx = self.indexAt(pos)
-      if not idx.isValid():
-          return self.rowCount()
-      row = idx.row()
-      if pos.y() > self.visualRect(idx).center().y():
-          row += 1
-      return max(0, min(row, self.rowCount()))
-
-  def mousePressEvent(self, event):
-      if event.button() == Qt.MouseButton.LeftButton:
-          index = self.indexAt(event.pos())
-          if index.isValid():
-              self._press_row = index.row()
-              self._press_pos = event.pos()
-              self._dragging = False
-          else:
-              self._press_row = -1
-              self.clearSelection()
-      super().mousePressEvent(event)
-
-  def mouseMoveEvent(self, event):
-      if (
-          self._press_row >= 0
-          and event.buttons() & Qt.MouseButton.LeftButton
-          and self._press_pos is not None
-      ):
-          if not self._dragging:
-              dist = (event.pos() - self._press_pos).manhattanLength()
-              if dist >= QApplication.startDragDistance():
-                  self._dragging = True
-                  self.selectRow(self._press_row)
-          if self._dragging:
-              self.viewport().setCursor(Qt.CursorShape.DragMoveCursor)
-      super().mouseMoveEvent(event)
-
-  def mouseReleaseEvent(self, event):
-      if (
-          event.button() == Qt.MouseButton.LeftButton
-          and self._dragging
-          and self._press_row >= 0
-          and self.parent_window
-          and hasattr(self.parent_window, "_move_queue_row")
-      ):
-          dest = self._insert_index_at(event.pos())
-          self.parent_window._move_queue_row(self._press_row, dest)
-      self._press_row = -1
-      self._press_pos = None
-      self._dragging = False
-      self.viewport().unsetCursor()
-      super().mouseReleaseEvent(event)
-
 class RenderQueueWorker(QThread):
   log_signal = Signal(str)
   update_row_signal = Signal(int, str, str, str)
   progress_signal = Signal(int, int, int)
-  frame_progress_signal = Signal(int, float)
+  frame_progress_signal = Signal(int, float, int, int, float)
   finished_signal = Signal(bool)
 
-  def __init__(self, queue_data, parent=None):
+  def __init__(self, queue_data, language="en", parent=None):
       super().__init__(parent)
       self.queue_data = queue_data
+      self.language = language
+
+  def _log(self, key, **kwargs):
+      self.log_signal.emit(log_msg(self.language, key, **kwargs))
 
   def run(self):
       from datetime import datetime
-      total = len(self.queue_data)
-      for job_index, item in enumerate(self.queue_data, start=1):
-          if self.isInterruptionRequested():
-              break
+      cancelled = False
+      try:
+          total = len(self.queue_data)
+          self._log("worker_thread_start", total=total)
+          for job_index, item in enumerate(self.queue_data, start=1):
+              if self.isInterruptionRequested():
+                  cancelled = True
+                  break
 
-          row = item["row"]
-          self.progress_signal.emit(job_index, total, row)
-          self.log_signal.emit(f"\n🎬 Рендер {job_index}/{total}: {os.path.basename(item['hip_file'])} | ROP: {item['rop_name']}")
-          ax = max(1, int(item["size_x"] * item["resize_pct"] / 100))
-          ay = max(1, int(item["size_y"] * item["resize_pct"] / 100))
-          self.log_signal.emit(
-              f"   Параметры: Кадры {item['start_frame']}-{item['end_frame']}, "
-              f"Размер: {ax}x{ay} (база {item['size_x']}x{item['size_y']}, Resize {item['resize_pct']:g}%)"
-          )
-          if item["output_path"]:
-              self.log_signal.emit(f"   Путь вывода: {item['output_path']}")
-          self.log_signal.emit(f"   Skip: {'Да' if item['skip_val'] == '1' else 'Нет'}")
-
-          if item["skip_val"] == "1" and item["output_path"]:
-              if self.all_frames_exist(
-                  item["output_path"],
-                  item["start_frame"],
-                  item["end_frame"],
-                  item["hip_file"],
-                  item["rop_name"],
-              ):
-                  self.log_signal.emit(f"✅ Пропускаю рендер, все кадры уже существуют: {item['output_path']}")
-                  completed_time = datetime.now().strftime("%H:%M:%S")
-                  self.update_row_signal.emit(row, "Skipped", completed_time, completed_time)
-                  continue
-
-          start_time = datetime.now().strftime("%H:%M:%S")
-          self.update_row_signal.emit(row, "Running", start_time, "")
-
-          try:
-              frame_cb = None
-              if item["send2bot"] > 0 and item["output_path"]:
-                  frame_cb = lambda f, p, it=item: self.send_frame_preview(f, p, it["rop_name"])
-
-              progress_cb = lambda ratio, r=row: self.frame_progress_signal.emit(r, ratio)
-
-              run_render(
-                  scene=item["hip_file"],
-                  rop=item["rop_name"],
-                  renderer=item["rop_type"],
+              row = item["row"]
+              self.progress_signal.emit(job_index, total, row)
+              self._log(
+                  "worker_job",
+                  job_index=job_index,
+                  total=total,
+                  hip=os.path.basename(item["hip_file"]),
+                  rop_name=item["rop_name"],
+              )
+              ax = max(1, int(item["render_width"]))
+              ay = max(1, int(item["render_height"]))
+              self._log(
+                  "worker_params",
                   start_frame=item["start_frame"],
                   end_frame=item["end_frame"],
+                  ax=ax,
+                  ay=ay,
                   size_x=item["size_x"],
                   size_y=item["size_y"],
                   resize_pct=item["resize_pct"],
-                  render_width=item["render_width"],
-                  render_height=item["render_height"],
-                  output_path=item["output_path"],
-                  log_callback=self.log_signal.emit,
-                  send2bot=item["send2bot"],
-                  hip_file=item["hip_file"],
-                  frame_callback=frame_cb,
-                  progress_callback=progress_cb,
-                  skip_existing_frames=item["skip_val"] == "1",
               )
+              if item["output_path"]:
+                  self._log("worker_output_path", path=item["output_path"])
+              skip_key = "worker_skip_yes" if item["skip_val"] == "1" else "worker_skip_no"
+              self._log(skip_key)
 
-              if self.isInterruptionRequested():
-                  self.update_row_signal.emit(row, "Stopped", "", datetime.now().strftime("%H:%M:%S"))
-                  break
+              if item["skip_val"] == "1" and item["output_path"]:
+                  total_frames = item["end_frame"] - item["start_frame"] + 1
+                  missing = missing_render_frames(
+                      item["output_path"],
+                      item["start_frame"],
+                      item["end_frame"],
+                      item["hip_file"],
+                      item["rop_name"],
+                  )
+                  if not missing:
+                      self._log(
+                          "worker_skip_all",
+                          total_frames=total_frames,
+                          start_frame=item["start_frame"],
+                          end_frame=item["end_frame"],
+                      )
+                      completed_time = datetime.now().strftime("%H:%M:%S")
+                      self.update_row_signal.emit(row, "Skipped", completed_time, completed_time)
+                      continue
+                  on_disk = total_frames - len(missing)
+                  if on_disk > 0:
+                      self._log(
+                          "worker_skip_partial",
+                          on_disk=on_disk,
+                          total_frames=total_frames,
+                          missing_count=len(missing),
+                      )
 
-              self.update_row_signal.emit(row, "Completed", "", datetime.now().strftime("%H:%M:%S"))
-          except Exception as e:
-              self.log_signal.emit(f"❌ Ошибка при рендеринге {item['rop_name']}: {e}")
-              self.update_row_signal.emit(row, "Failed", "", datetime.now().strftime("%H:%M:%S"))
-          self.msleep(100)
+              start_time = datetime.now().strftime("%H:%M:%S")
+              self.update_row_signal.emit(row, "Running", start_time, "")
 
-      self.finished_signal.emit(self.isInterruptionRequested())
+              try:
+                  frame_cb = None
+                  if item["send2bot"] > 0 and item["output_path"]:
+                      frame_cb = lambda f, p, it=item: self.send_frame_preview(f, p, it["rop_name"])
+
+                  progress_cb = (
+                      lambda ratio, wd, wt, fs, r=row: self.frame_progress_signal.emit(
+                          r, ratio, wd, wt, fs
+                      )
+                  )
+
+                  run_render(
+                      scene=item["hip_file"],
+                      rop=item["rop_name"],
+                      renderer=item["rop_type"],
+                      start_frame=item["start_frame"],
+                      end_frame=item["end_frame"],
+                      size_x=item["size_x"],
+                      size_y=item["size_y"],
+                      resize_pct=item["resize_pct"],
+                      render_width=item["render_width"],
+                      render_height=item["render_height"],
+                      output_path=item["output_path"],
+                      log_callback=self.log_signal.emit,
+                      send2bot=item["send2bot"],
+                      hip_file=item["hip_file"],
+                      frame_callback=frame_cb,
+                      progress_callback=progress_cb,
+                      skip_existing_frames=item["skip_val"] == "1",
+                      language=self.language,
+                  )
+
+                  if self.isInterruptionRequested():
+                      self.update_row_signal.emit(row, "Stopped", "", datetime.now().strftime("%H:%M:%S"))
+                      cancelled = True
+                      break
+
+                  self.update_row_signal.emit(row, "Completed", "", datetime.now().strftime("%H:%M:%S"))
+                  self.send_mp4_preview(item)
+              except Exception as e:
+                  self._log("worker_render_error", rop_name=item["rop_name"], e=e)
+                  self.update_row_signal.emit(row, "Failed", "", datetime.now().strftime("%H:%M:%S"))
+              self.msleep(100)
+      except Exception as e:
+          self._log("worker_critical", e=e)
+          cancelled = self.isInterruptionRequested()
+      finally:
+          self.finished_signal.emit(cancelled or self.isInterruptionRequested())
 
   def send_frame_preview(self, frame, frame_path, rop_name=""):
-      self.log_signal.emit(f"📤 Отправка кадра {frame} в Telegram: {os.path.basename(frame_path)}")
+      basename = os.path.basename(frame_path)
+      self._log("worker_tg_send_frame", frame=frame, basename=basename)
       try:
           caption = f"Frame {frame}"
           if rop_name:
               caption += f" — {rop_name}"
-          caption += f" — {os.path.basename(frame_path)}"
+          caption += f" — {basename}"
           sent, err = send_image(frame_path, caption=caption)
           if sent:
-              self.log_signal.emit(f"✅ Кадр {frame} отправлен в Telegram: {os.path.basename(frame_path)}")
+              self._log("worker_tg_frame_ok", frame=frame, basename=basename)
           else:
               detail = f" ({err})" if err else ""
-              self.log_signal.emit(
-                  f"⚠️ Не удалось отправить кадр {frame}: {os.path.basename(frame_path)}{detail}"
+              self._log(
+                  "worker_tg_frame_fail",
+                  frame=frame,
+                  basename=basename,
+                  detail=detail,
               )
       except Exception as e:
-          self.log_signal.emit(f"⚠️ Ошибка при отправке кадра {frame}: {e}")
+          self._log("worker_tg_frame_error", frame=frame, e=e)
 
-  def all_frames_exist(self, output_path, start_frame, end_frame, hip_file=None, op_name=None):
-      existing_frames = {
-          frame for frame, _ in self.resolve_rendered_frames(
-              output_path, start_frame, end_frame, hip_file, op_name
+  def send_mp4_preview(self, item):
+      from video_preview import build_mp4_from_sequence
+      import telegram_notifier as tg
+
+      mp4_path = None
+      tg.reload_config()
+      if not item.get("send_mp4"):
+          return
+      if not item.get("output_path"):
+          return
+      self._log("worker_mp4_build")
+      max_side = get_mp4_max_side()
+      mp4_path, err = build_mp4_from_sequence(
+          item["output_path"],
+          item["start_frame"],
+          item["end_frame"],
+          hip_file=item["hip_file"],
+          op_name=item["rop_name"],
+          max_side=max_side,
+      )
+      if not mp4_path:
+          fail_msg = err or ("failed to create" if self.language == "en" else "не удалось создать")
+          self._log("worker_mp4_fail_create", err=fail_msg)
+          return
+      try:
+          caption = (
+              f"Preview — {item['rop_name']} "
+              f"({item['start_frame']}-{item['end_frame']})"
           )
-      }
-      return existing_frames == set(range(start_frame, end_frame + 1))
-
-  def resolve_rendered_frames(self, output_path, start_frame, end_frame, hip_file=None, op_name=None):
-      candidates = []
-      if not output_path:
-          return candidates
-      for frame in range(start_frame, end_frame + 1):
-          candidate = expand_frame_in_path(output_path, frame, hip_file, op_name)
-          if candidate and os.path.exists(candidate):
-              candidates.append((frame, candidate))
-      if candidates:
-          return candidates
-      glob_path = resolve_houdini_vars(output_path, hip_file, op_name)
-      glob_path = re.sub(r"\$F(\d+)", "*", glob_path)
-      glob_path = re.sub(r"\$F\b", "*", glob_path)
-      glob_path = re.sub(r"%0(\d+)d", "*", glob_path)
-      glob_path = glob_path.replace("#", "*")
-      directory = os.path.dirname(glob_path) or "."
-      if not os.path.isdir(directory):
-          return candidates
-      for file_path in sorted(glob.glob(glob_path)):
-          frame_match = re.search(r"(\d+)(?=[^\d]*$)", file_path)
-          if frame_match:
-              frame = int(frame_match.group(1))
-              if start_frame <= frame <= end_frame:
-                  candidates.append((frame, file_path))
-      return candidates
+          sent, send_err = send_video(mp4_path, caption=caption)
+          if sent:
+              self._log("worker_mp4_ok")
+          else:
+              fail_msg = send_err or ("send error" if self.language == "en" else "ошибка отправки")
+              self._log("worker_mp4_send_fail", err=fail_msg)
+      except Exception as e:
+          self._log("worker_mp4_error", e=e)
+      finally:
+          try:
+              if mp4_path and os.path.isfile(mp4_path):
+                  os.remove(mp4_path)
+          except OSError:
+              pass
 
   def is_preview_frame(self, frame_path):
       basename = os.path.basename(frame_path).lower()
@@ -809,53 +824,81 @@ class RenderManager(QWidget):
       self._resize_update_guard = False
       self._render_job_cur = 0
       self._render_job_total = 0
+      self._jobs_done = 0
+      self._active_render_ratio = 0.0
+      self._progress_ui_row = -1
+      self._active_render_rows = []
+      self._row_render_start = {}
+      self._job_duration_samples = []
+      self._row_eta_meta = {}
+      self._row_work_ratio = {}
+      self._row_work_done = {}
+      self._row_last_frame_mono = {}
+      self._row_frame_seconds = {}
+      self._job_duration_samples = []
 
       self.setWindowTitle(TRANSLATIONS[self.current_language]["title"])
       icon_path = app_icon_path()
       if os.path.exists(icon_path):
           self.setWindowIcon(QIcon(icon_path))
       self.setAcceptDrops(True)
+      self.setMinimumSize(320, 120)
       main_layout = QVBoxLayout(self)
 
       # --- Zone 1 ---
       group1 = QGroupBox(TRANSLATIONS[self.current_language]["zone1"])
       self.ui_elements["group1"] = group1
-      group1.setMaximumHeight(60)  # Fixed height for Zone 1
+      group1.setMaximumHeight(70)  # Zone 1: hython + action buttons
       zone1 = QHBoxLayout()
       zone1.setContentsMargins(5, 5, 5, 5)
-      zone1.addWidget(QLabel(TRANSLATIONS[self.current_language]["houdini_version"]))
+      self.houdini_version_label = QLabel(TRANSLATIONS[self.current_language]["houdini_version"])
+      self.ui_elements["houdini_version_label"] = self.houdini_version_label
+      zone1.addWidget(self.houdini_version_label)
       self.houdini_versions = QComboBox()
       self.houdini_versions.addItems(self.detect_houdini_versions())
-      self.houdini_versions.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)  # Make ComboBox expandable
-      zone1.addWidget(self.houdini_versions)
-      zone1.addStretch()  # Fill space between ComboBox and Browse button
+      self.houdini_versions.setMinimumContentsLength(0)
+      self.houdini_versions.setMinimumWidth(48)
+      self.houdini_versions.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+      self.houdini_versions.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+      zone1.addWidget(self.houdini_versions, 1)
+
+      zone1_btns = QHBoxLayout()
+      zone1_btns.setContentsMargins(0, 0, 0, 0)
+      zone1_btns.setSpacing(4)
 
       browse_btn = QPushButton(TRANSLATIONS[self.current_language]["browse"])
       self.ui_elements["browse_btn"] = browse_btn
       browse_btn.clicked.connect(self.browse_hython)
-      zone1.addWidget(browse_btn)
+      zone1_btns.addWidget(browse_btn)
 
       save_btn = QPushButton(TRANSLATIONS[self.current_language]["save_settings"])
       self.ui_elements["save_btn"] = save_btn
       save_btn.clicked.connect(self.save_settings)
-      zone1.addWidget(save_btn)
+      zone1_btns.addWidget(save_btn)
 
       self.check_btn = QPushButton(TRANSLATIONS[self.current_language]["check_env"])
       self.ui_elements["check_btn"] = self.check_btn
       self.check_btn.clicked.connect(self.check_environment)
-      zone1.addWidget(self.check_btn)
+      zone1_btns.addWidget(self.check_btn)
 
       telegram_btn = QPushButton(TRANSLATIONS[self.current_language]["telegram_settings"])
       self.ui_elements["telegram_btn"] = telegram_btn
       telegram_btn.clicked.connect(self.open_telegram_settings)
-      zone1.addWidget(telegram_btn)
+      zone1_btns.addWidget(telegram_btn)
 
       self.language_btn = QPushButton(self.current_language.upper())
       self.ui_elements["language_btn"] = self.language_btn
       self.language_btn.clicked.connect(self.switch_language)
-      zone1.addWidget(self.language_btn)
+      zone1_btns.addWidget(self.language_btn)
+
+      self._zone1_btns_widget = QWidget()
+      self._zone1_btns_widget.setLayout(zone1_btns)
+      self._zone1_btns_widget.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+      zone1.addWidget(self._zone1_btns_widget, 0)
 
       group1.setLayout(zone1)
+      group1.setMinimumWidth(0)
+      group1.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
       self._top_bar = QWidget()
       self._top_bar.setObjectName("appHeader")
@@ -868,17 +911,19 @@ class RenderManager(QWidget):
       self.app_logo_label.setScaledContents(False)
       self.app_title_label = QLabel("HOUDINI RENDER MANAGER")
       self.app_title_label.setObjectName("appTitleLabel")
+      self.app_title_label.setMinimumWidth(0)
+      self.app_title_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
       self._apply_header_logo(find_bundled_file("logo_met2.png"))
 
       top_layout.addWidget(self.app_logo_label, 0, Qt.AlignmentFlag.AlignVCenter)
       top_layout.addWidget(self.app_title_label, 0, Qt.AlignmentFlag.AlignVCenter)
       top_layout.addWidget(group1, 1)
+      self._top_bar.setMinimumSize(0, 0)
 
-      # --- Zone 2 & 3 ---
-      top_zone_layout = QHBoxLayout()
-      
+      # --- Zone 2 & 3 & 4 ---
       group2 = QGroupBox(TRANSLATIONS[self.current_language]["zone2"])
       self.ui_elements["group2"] = group2
+      group2.setToolTip(TRANSLATIONS[self.current_language]["zone2_tip"])
       zone2 = QVBoxLayout()
       
       zone2.addWidget(QLabel(TRANSLATIONS[self.current_language]["hip_files"]))
@@ -888,6 +933,7 @@ class RenderManager(QWidget):
       self.hip_list.currentItemChanged.connect(self.on_hip_current_changed)
       self.hip_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
       self.hip_list.customContextMenuRequested.connect(self.on_hip_context_menu)
+      self.hip_list.setMinimumSize(0, 0)
       zone2.addWidget(self.hip_list)
 
       self.hip_scan_label = QLabel()
@@ -909,11 +955,17 @@ class RenderManager(QWidget):
       
       zone2.addLayout(hip_btns_layout)
       group2.setLayout(zone2)
+      group2.setMinimumSize(0, 0)
+      group2.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
-      # --- Zone 3 ---
+      # --- Zone 3 (fixed width) ---
       group3 = QGroupBox(TRANSLATIONS[self.current_language]["zone3"])
       self.ui_elements["group3"] = group3
-      group3.setMinimumWidth(200)
+      group3.setMinimumWidth(ZONE3_FIXED_WIDTH)
+      group3.setMaximumWidth(ZONE3_FIXED_WIDTH)
+      group3.setMinimumHeight(0)
+      group3.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+      group3.setToolTip(TRANSLATIONS[self.current_language]["zone3_tip"])
       zone3 = QHBoxLayout()
       self.scan_btn = QPushButton(TRANSLATIONS[self.current_language]["scan_hip"])
       self.ui_elements["scan_btn"] = self.scan_btn
@@ -926,6 +978,7 @@ class RenderManager(QWidget):
       # --- Zone 4 ---
       group4 = QGroupBox(TRANSLATIONS[self.current_language]["zone4"])
       self.ui_elements["group4"] = group4
+      group4.setToolTip(TRANSLATIONS[self.current_language]["zone4_tip"])
       zone4 = QVBoxLayout()
       self.found_nodes_label = QLabel(TRANSLATIONS[self.current_language]["found_nodes"])
       self.ui_elements["found_nodes_label"] = self.found_nodes_label
@@ -949,8 +1002,10 @@ class RenderManager(QWidget):
           f.stateChanged.connect(self.apply_filter)
           filter_layout.addWidget(f)
       zone4.addLayout(filter_layout)
-      self.rop_list = QListWidget()
+      self.rop_list = CompactListWidget()
       self.rop_list.setSelectionMode(QAbstractItemView.MultiSelection)
+      self.rop_list.setMinimumSize(0, 0)
+      self.rop_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
       zone4.addWidget(self.rop_list)
 
       rop_btn_layout = QHBoxLayout()
@@ -970,44 +1025,72 @@ class RenderManager(QWidget):
       
       zone4.addLayout(rop_btn_layout)
       group4.setLayout(zone4)
-      
-      top_zone_layout.addWidget(group2, 1)
-      top_zone_layout.addWidget(group3, 0)
-      top_zone_layout.addWidget(group4, 1)
-      
-      # We need a container widget for the top layout to put it in the splitter
+      group4.setMinimumSize(0, 0)
+      group4.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+      self.top_zones_splitter = MainSplitter(Qt.Orientation.Horizontal, queue_handle_indexes=())
+      self.top_zones_splitter.addWidget(group2)
+      self.top_zones_splitter.addWidget(group3)
+      self.top_zones_splitter.addWidget(group4)
+      self.top_zones_splitter.setStretchFactor(0, 1)
+      self.top_zones_splitter.setStretchFactor(1, 0)
+      self.top_zones_splitter.setStretchFactor(2, 1)
+      self.top_zones_splitter.setCollapsible(0, False)
+      self.top_zones_splitter.setCollapsible(1, False)
+      self.top_zones_splitter.setCollapsible(2, False)
+      self.top_zones_splitter.setChildrenCollapsible(False)
+      self.top_zones_splitter.setSizes([320, ZONE3_FIXED_WIDTH, 320])
+      self.top_zones_splitter.configure_handles(
+          TRANSLATIONS[self.current_language]["splitter_zones_resize"]
+      )
+
       top_container = QWidget()
-      top_container.setLayout(top_zone_layout)
+      top_container_layout = QVBoxLayout(top_container)
+      top_container_layout.setContentsMargins(0, 0, 0, 0)
+      top_container_layout.setSpacing(0)
+      top_container_layout.addWidget(self.top_zones_splitter)
+      top_container.setMinimumSize(0, 0)
+      top_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
       self.ui_elements["top_container"] = top_container
 
       # --- Zone 5 ---
       group5 = QGroupBox(TRANSLATIONS[self.current_language]["zone5"])
       self.ui_elements["group5"] = group5
+      group5.setToolTip(TRANSLATIONS[self.current_language]["zone5_tip"])
       zone5 = QVBoxLayout()
       self.render_progress_label = QLabel()
       self.render_progress_label.setStyleSheet("color: #00BFFF; font-size: 12px;")
       self.ui_elements["render_progress_label"] = self.render_progress_label
       zone5.addWidget(self.render_progress_label)
-      self.queue_table = RenderQueueTable(self)
-      self.queue_table.setColumnCount(16)
-      self.queue_table.setHorizontalHeaderLabels(
-          TRANSLATIONS[self.current_language]["queue_headers"]
-      )
-      self.queue_table.setColumnWidth(12, 100)
-      self.queue_table.setColumnWidth(0, 56)
-      self.queue_table.setColumnWidth(1, 260)
-      self.queue_table.setColumnWidth(2, 180)
-      self.queue_table.setColumnWidth(6, 56)
-      self.queue_table.setColumnWidth(10, 320)
+      self.render_progress_bar = QProgressBar()
+      self.render_progress_bar.setRange(0, 100)
+      self.render_progress_bar.setValue(0)
+      self.render_progress_bar.setTextVisible(True)
+      self.render_progress_bar.setFormat("%p%")
+      self.ui_elements["render_progress_bar"] = self.render_progress_bar
+      zone5.addWidget(self.render_progress_bar)
+      self.queue_model = RenderQueueModel(TRANSLATIONS[self.current_language]["queue_headers"])
+      self.queue_table = RenderQueueView(self)
+      self.queue_table.setModel(self.queue_model)
+      self.queue_model.data_changed_user.connect(self.on_queue_cell_changed)
+      self.queue_table.setColumnWidth(0, 48)
+      self.queue_table.setColumnWidth(1, 140)
+      self.queue_table.setColumnWidth(2, 120)
+      self.queue_table.setColumnWidth(6, 48)
+      self.queue_table.setColumnWidth(10, 180)
+      self.queue_table.setColumnWidth(COL_SEND2BOT, 56)
+      self.queue_table.setColumnWidth(COL_SEND_MP4, 56)
+      self.queue_table.setColumnWidth(COL_ETA, 100)
       queue_header = self.queue_table.horizontalHeader()
       queue_header.setStretchLastSection(True)
       queue_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-      queue_header.setMinimumSectionSize(40)
+      queue_header.setMinimumSectionSize(28)
       self.toggle_delegate = ToggleCheckBoxDelegate(
           self.queue_table, on_toggled=self._on_queue_toggle_changed
       )
       self.queue_table.setItemDelegateForColumn(0, self.toggle_delegate)
       self.queue_table.setItemDelegateForColumn(6, self.toggle_delegate)
+      self.queue_table.setItemDelegateForColumn(COL_SEND_MP4, self.toggle_delegate)
       self.path_edit_delegate = FullPathEditDelegate(
           self.queue_table, on_committed=self._on_path_cell_committed
       )
@@ -1015,8 +1098,7 @@ class RenderManager(QWidget):
       self.queue_table.setItemDelegateForColumn(COL_HIP, self.path_edit_delegate)
       self.queue_table.setItemDelegateForColumn(COL_OUTPUT, self.path_edit_delegate)
       self.queue_table.setItemDelegateForColumn(COL_STATUS, self.status_progress_delegate)
-      self.queue_table.cellChanged.connect(self.on_queue_cell_changed)
-      self.queue_table.cellDoubleClicked.connect(self.on_queue_cell_double_clicked)
+      self.queue_table.doubleClicked.connect(self._on_queue_double_clicked)
       self.queue_table.selectionModel().selectionChanged.connect(self.on_queue_selection_changed)
       self.queue_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
       self.queue_table.customContextMenuRequested.connect(self.on_queue_context_menu)
@@ -1036,7 +1118,7 @@ class RenderManager(QWidget):
       set_disabled_style(self.stop_btn)
       self.stop_btn.clicked.connect(self.stop_render)
       btn_layout1.addWidget(self.stop_btn)
-      zone5.addLayout(btn_layout1)
+      zone5.addWidget(_horizontal_button_bar(btn_layout1, height=36))
 
       btn_layout2 = QHBoxLayout()
       self.enable_all_btn = QPushButton(TRANSLATIONS[self.current_language]["enable_all"])
@@ -1089,27 +1171,73 @@ class RenderManager(QWidget):
       set_disabled_style(self.remove_rop_btn)
       self.remove_rop_btn.clicked.connect(self.remove_rop_from_queue)
       btn_layout2.addWidget(self.remove_rop_btn)
-      zone5.addLayout(btn_layout2)
+      zone5.addWidget(_horizontal_button_bar(btn_layout2, height=36))
       group5.setLayout(zone5)
+      group5.setMinimumSize(0, 0)
+      group5.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
       # --- Log ---
       self.log_output = QTextEdit()
       self.log_output.setReadOnly(True)
+      self.log_output.setMinimumSize(0, 0)
+      self.log_output.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
       self.log_output.setStyleSheet("QTextEdit { background-color: #191919; color: #ffffff; border: 1px solid #555555; }")
+      self.log_position_btn = QPushButton()
+      self.ui_elements["log_position_btn"] = self.log_position_btn
+      self.log_position_btn.setToolTip(TRANSLATIONS[self.current_language]["log_position_tip"])
+      self.log_position_btn.clicked.connect(self.toggle_log_position)
+
       clear_log_btn = QPushButton(TRANSLATIONS[self.current_language]["clear_log"])
       self.ui_elements["clear_log_btn"] = clear_log_btn
       clear_log_btn.clicked.connect(self.clear_log)
 
-      self.main_splitter = MainSplitter(Qt.Orientation.Vertical)
-      self.main_splitter.addWidget(top_container)
-      self.main_splitter.addWidget(group5)
-      self.main_splitter.addWidget(self.log_output)
+      log_btn_row = QHBoxLayout()
+      log_btn_row.setContentsMargins(0, 0, 0, 0)
+      log_btn_row.setSpacing(6)
+      log_btn_row.addWidget(self.log_position_btn)
+      log_btn_row.addWidget(clear_log_btn)
+      log_btn_row.addStretch()
+
+      self.log_panel = QWidget()
+      self.log_panel.setMinimumSize(0, 0)
+      log_panel_layout = QVBoxLayout(self.log_panel)
+      log_panel_layout.setContentsMargins(0, 0, 0, 0)
+      log_panel_layout.setSpacing(4)
+      log_panel_layout.addWidget(self.log_output, 1)
+      log_panel_layout.addLayout(log_btn_row)
+
+      self.log_position = "bottom"
+      self._splitter_states = {"bottom": None, "right": None, "queue": None, "top_zones": None}
+
+      self.queue_splitter = MainSplitter(Qt.Orientation.Vertical, queue_handle_indexes=(0,))
+      self.queue_splitter.setMinimumSize(0, 0)
+      self.queue_splitter.addWidget(top_container)
+      self.queue_splitter.addWidget(group5)
+      self.queue_splitter.setStretchFactor(0, 1)
+      self.queue_splitter.setStretchFactor(1, 2)
+
+      self.main_splitter = MainSplitter(Qt.Orientation.Vertical, queue_handle_indexes=())
+      self.main_splitter.setMinimumSize(0, 0)
+      self.main_splitter.addWidget(self.queue_splitter)
+      self.main_splitter.addWidget(self.log_panel)
       self.main_splitter.configure_handles(
           TRANSLATIONS[self.current_language]["splitter_queue_resize"]
       )
+      self.queue_splitter.configure_handles(
+          TRANSLATIONS[self.current_language]["splitter_queue_resize"]
+      )
       main_layout.addWidget(self._top_bar)
-      main_layout.addWidget(self.main_splitter)
-      main_layout.addWidget(clear_log_btn)
+
+      self.workflow_guide = QLabel()
+      self.workflow_guide.setObjectName("workflowGuide")
+      self.workflow_guide.setWordWrap(True)
+      self.workflow_guide.setTextFormat(Qt.TextFormat.RichText)
+      self.workflow_guide.setMinimumHeight(0)
+      self.workflow_guide.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+      self.workflow_guide.setText(TRANSLATIONS[self.current_language]["workflow_html"])
+      self.ui_elements["workflow_guide"] = self.workflow_guide
+      main_layout.addWidget(self.workflow_guide)
+      main_layout.addWidget(self.main_splitter, 1)
 
       self.all_rops = []
       self._render_jobs = []
@@ -1119,7 +1247,12 @@ class RenderManager(QWidget):
       # Apply dark theme
       apply_dark_theme(self)
       
-      self.main_splitter.setSizes([400, 200, 150])
+      self.main_splitter.setSizes([700, 180])
+      self.queue_splitter.setSizes([400, 220])
+      self._update_log_position_btn()
+      self._apply_layout_resize_policies()
+      self._sync_zone1_layout()
+      self._update_global_progress(0, 0, -1, "")
 
   def restore_window(self):
       if os.path.exists(CONFIG_FILE):
@@ -1128,22 +1261,50 @@ class RenderManager(QWidget):
                   data = json.load(f)
               if "language" in data:
                   self.current_language = data["language"]
+              if data.get("hython_path"):
+                  hython_path = str(data["hython_path"]).strip()
+                  if hython_path:
+                      if self.houdini_versions.findText(hython_path) < 0:
+                          self.houdini_versions.addItem(hython_path)
+                      self.houdini_versions.setCurrentText(hython_path)
               if "geometry" in data and data["geometry"]:
                   try:
                       geom = QByteArray.fromHex(data["geometry"].encode())
                       self.restoreGeometry(geom)
                   except Exception as e:
-                      self.log(f"Ошибка восстановления геометрии: {e}")
+                      self.log_t("geom_restore_error", e=e)
               if "splitter_state" in data and data["splitter_state"]:
-                  try:
-                      state = QByteArray.fromHex(data["splitter_state"].encode())
-                      self.main_splitter.restoreState(state)
-                  except Exception as e:
-                      self.log(f"Ошибка восстановления splitter: {e}")
+                  self._splitter_states["bottom"] = data["splitter_state"]
+              ui_cfg = data.get("ui", {})
+              if ui_cfg.get("splitter_state_bottom"):
+                  self._splitter_states["bottom"] = ui_cfg["splitter_state_bottom"]
+              if ui_cfg.get("splitter_state_right"):
+                  self._splitter_states["right"] = ui_cfg["splitter_state_right"]
+              if ui_cfg.get("queue_splitter_state"):
+                  self._splitter_states["queue"] = ui_cfg["queue_splitter_state"]
+              if ui_cfg.get("top_zones_splitter_state"):
+                  self._splitter_states["top_zones"] = ui_cfg["top_zones_splitter_state"]
+              log_pos = ui_cfg.get("log_position", "bottom")
+              if log_pos in ("bottom", "right"):
+                  self.log_position = log_pos
               if hasattr(self, "main_splitter"):
+                  self.main_splitter.setOrientation(
+                      Qt.Orientation.Vertical
+                      if self.log_position == "bottom"
+                      else Qt.Orientation.Horizontal
+                  )
+                  self._update_log_position_btn()
+                  self.queue_splitter.configure_handles(
+                      TRANSLATIONS[self.current_language]["splitter_queue_resize"]
+                  )
                   self.main_splitter.configure_handles(
                       TRANSLATIONS[self.current_language]["splitter_queue_resize"]
                   )
+                  if hasattr(self, "top_zones_splitter"):
+                      self.top_zones_splitter.configure_handles(
+                          TRANSLATIONS[self.current_language]["splitter_zones_resize"]
+                      )
+              self._apply_layout_resize_policies()
               if "hip_files" in data:
                   if data["hip_files"]:
                       for hip in data["hip_files"]:
@@ -1158,11 +1319,10 @@ class RenderManager(QWidget):
                   if data["queue"]:
                       for entry in data["queue"]:
                           row = self.queue_table.rowCount()
-                          self.queue_table.insertRow(row)
                           self._populate_queue_row(row, entry=entry)
-                      self.log(f"Восстановлена очередь из {len(data['queue'])} элементов")
+                      self.log_t("queue_restored", count=len(data["queue"]))
           except Exception as e:
-              self.log(f"Ошибка восстановления окна: {e}")
+              self.log_t("window_restore_error", e=e)
       
       # Ensure window is on screen
       screen = QApplication.primaryScreen().availableGeometry()
@@ -1191,7 +1351,13 @@ class RenderManager(QWidget):
                       if i < self.queue_table.columnCount():
                           self.queue_table.setColumnWidth(i, width)
       except Exception as e:
-          self.log(f"Warning: Could not restore column widths: {e}")
+          self.log_t("column_widths_restore_error", e=e)
+
+      self._restore_layout_splitters()
+      
+      # Copy hython helper scripts (+ deps) beside .exe before first render
+      hython_script_path("render_rop.py")
+      hython_script_path("scan_rops.py")
       
       # Update Start button based on queue
       self.update_start_button()
@@ -1206,22 +1372,53 @@ class RenderManager(QWidget):
       ok, msg, hint = check_preview_dependencies()
       if ok:
           return
-      self.log(f"⚠️ Telegram превью: {msg}")
+      self.log_t("tg_preview_warn", msg=msg)
       if hint:
           self.log(f"   {hint}")
 
   def open_telegram_settings(self):
-      from telegram_notifier import reload_config, DEFAULT_PREVIEW_MAX_SIDE, PREVIEW_MIN_SIDE, PREVIEW_MAX_SIDE_LIMIT
+      from telegram_notifier import (
+          reload_config,
+          DEFAULT_PREVIEW_MAX_SIDE,
+          PREVIEW_MIN_SIDE,
+          PREVIEW_MAX_SIDE_LIMIT,
+      )
 
+      t = TRANSLATIONS[self.current_language]
       dlg = QDialog(self)
-      dlg.setWindowTitle(TRANSLATIONS[self.current_language]["telegram_settings"])
+      dlg.setWindowTitle(t["tg_dialog_title"])
+      dlg.setMinimumWidth(520)
+      apply_dark_theme(dlg)
       layout = QVBoxLayout(dlg)
+
+      instructions = QLabel(t["tg_instructions_html"])
+      instructions.setWordWrap(True)
+      instructions.setTextFormat(Qt.TextFormat.RichText)
+      instructions.setObjectName("tgInstructions")
+      scroll = QScrollArea()
+      scroll.setWidgetResizable(True)
+      scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+      scroll.setWidget(instructions)
+      scroll.setMaximumHeight(220)
+      layout.addWidget(scroll)
+
       token_input = QLineEdit()
+      token_input.setPlaceholderText("123456789:ABCdefGHI...")
       chat_input = QLineEdit()
+      chat_input.setPlaceholderText("-1001234567890")
       preview_max_spin = QSpinBox()
       preview_max_spin.setRange(PREVIEW_MIN_SIDE, PREVIEW_MAX_SIDE_LIMIT)
       preview_max_spin.setSingleStep(100)
       preview_max_spin.setValue(DEFAULT_PREVIEW_MAX_SIDE)
+
+      mp4_on_complete = QCheckBox(t["tg_mp4_on_complete"])
+      mp4_on_complete.setChecked(True)
+      mp4_use_preview = QCheckBox(t["tg_mp4_use_preview"])
+      mp4_use_preview.setChecked(True)
+      mp4_max_spin = QSpinBox()
+      mp4_max_spin.setRange(0, PREVIEW_MAX_SIDE_LIMIT)
+      mp4_max_spin.setSingleStep(100)
+      mp4_max_spin.setValue(0)
 
       if os.path.exists(CONFIG_FILE):
           try:
@@ -1234,22 +1431,43 @@ class RenderManager(QWidget):
                   preview_max_spin.setValue(int(tg.get("preview_max_side", DEFAULT_PREVIEW_MAX_SIDE)))
               except (TypeError, ValueError):
                   preview_max_spin.setValue(DEFAULT_PREVIEW_MAX_SIDE)
+              mp4_on_complete.setChecked(bool(tg.get("send_mp4_on_complete", True)))
+              mp4_use_preview.setChecked(bool(tg.get("mp4_use_preview_max_side", True)))
+              try:
+                  mp4_max_spin.setValue(int(tg.get("mp4_max_side", 0)))
+              except (TypeError, ValueError):
+                  mp4_max_spin.setValue(0)
           except json.JSONDecodeError:
               pass
 
-      layout.addWidget(QLabel(TRANSLATIONS[self.current_language]["bot_token"]))
+      def sync_mp4_spin():
+          mp4_max_spin.setEnabled(not mp4_use_preview.isChecked())
+
+      mp4_use_preview.toggled.connect(sync_mp4_spin)
+      sync_mp4_spin()
+
+      layout.addWidget(QLabel(t["bot_token"]))
       layout.addWidget(token_input)
-      layout.addWidget(QLabel(TRANSLATIONS[self.current_language]["chat_id"]))
+      layout.addWidget(QLabel(t["chat_id"]))
       layout.addWidget(chat_input)
-      layout.addWidget(QLabel(TRANSLATIONS[self.current_language]["tg_preview_max"]))
+      layout.addWidget(QLabel(t["tg_preview_max"]))
       layout.addWidget(preview_max_spin)
-      hint = QLabel(TRANSLATIONS[self.current_language]["tg_preview_hint"])
+      hint = QLabel(t["tg_preview_hint"])
       hint.setWordWrap(True)
       layout.addWidget(hint)
+      layout.addWidget(mp4_on_complete)
+      layout.addWidget(mp4_use_preview)
+      layout.addWidget(QLabel(t["tg_mp4_max_side"]))
+      layout.addWidget(mp4_max_spin)
 
-      save_btn = QPushButton(TRANSLATIONS[self.current_language]["save"])
-      check_btn = QPushButton(TRANSLATIONS[self.current_language]["check_bot"])
-      test_btn = QPushButton(TRANSLATIONS[self.current_language]["send_test"])
+      btn_row = QHBoxLayout()
+      save_btn = QPushButton(t["save"])
+      check_btn = QPushButton(t["check_bot"])
+      test_btn = QPushButton(t["send_test"])
+      btn_row.addWidget(save_btn)
+      btn_row.addWidget(check_btn)
+      btn_row.addWidget(test_btn)
+      layout.addLayout(btn_row)
 
       def save_cfg():
           if os.path.exists(CONFIG_FILE):
@@ -1261,54 +1479,48 @@ class RenderManager(QWidget):
           else:
               data = {}
           data.setdefault("telegram", {})
-          data["telegram"]["bot_token"] = token_input.text()
-          data["telegram"]["chat_id"] = chat_input.text()
+          data["telegram"]["bot_token"] = token_input.text().strip()
+          data["telegram"]["chat_id"] = chat_input.text().strip()
           data["telegram"]["preview_max_side"] = preview_max_spin.value()
+          data["telegram"]["send_mp4_on_complete"] = mp4_on_complete.isChecked()
+          data["telegram"]["mp4_use_preview_max_side"] = mp4_use_preview.isChecked()
+          data["telegram"]["mp4_max_side"] = mp4_max_spin.value()
           with open(CONFIG_FILE, "w", encoding="utf-8") as f:
               json.dump(data, f, indent=4, ensure_ascii=False)
           reload_config()
           dlg.accept()
-          self.log(TRANSLATIONS[self.current_language]["tg_saved"])
+          self.log(t["tg_saved"])
 
       def check_bot():
-          token = token_input.text()
-          chat_id = chat_input.text()
-          if not token or not chat_id:
-              self.log("⚠️ Telegram токен или chat_id не заданы.")
+          token = token_input.text().strip()
+          if not token:
+              self.log_t("tg_token_empty")
               return
-          url = f"https://api.telegram.org/bot{token}/getMe"
-          try:
-              resp = requests.get(url, timeout=5)
-              if resp.status_code == 200:
-                  self.log("✅ Telegram бот доступен.")
-              else:
-                  self.log(f"❌ Ошибка подключения: {resp.status_code}")
-          except Exception as e:
-              self.log(f"Ошибка проверки Telegram: {e}")
+          ok, err = test_bot_connection(bot_token=token)
+          if ok:
+              self.log_t("tg_bot_ok")
+          else:
+              self.log_t("tg_bot_check_fail", err=err)
 
       def send_test_message():
-          token = token_input.text()
-          chat_id = chat_input.text()
+          token = token_input.text().strip()
+          chat_id = chat_input.text().strip()
           if not token or not chat_id:
-              self.log("⚠️ Telegram токен или chat_id не заданы.")
+              self.log_t("tg_creds_missing")
               return
-          url = f"https://api.telegram.org/bot{token}/sendMessage"
-          payload = {"chat_id": chat_id, "text": "🚀 Test message from Houdini Render Manager!"}
-          try:
-              resp = requests.post(url, json=payload, timeout=5)
-              if resp.status_code == 200:
-                  self.log("✅ Тестовое сообщение отправлено!")
-              else:
-                  self.log(f"❌ Ошибка отправки: {resp.status_code}")
-          except Exception as e:
-              self.log(f"Ошибка при отправке тестового сообщения: {e}")
+          ok, err = send_message(
+              "🚀 Test message from Houdini Render Manager!",
+              bot_token=token,
+              chat_id=chat_id,
+          )
+          if ok:
+              self.log_t("tg_test_ok")
+          else:
+              self.log_t("tg_send_fail", err=err)
 
       save_btn.clicked.connect(save_cfg)
       check_btn.clicked.connect(check_bot)
       test_btn.clicked.connect(send_test_message)
-      layout.addWidget(save_btn)
-      layout.addWidget(check_btn)
-      layout.addWidget(test_btn)
       dlg.exec()
 
   def dragEnterEvent(self, event):
@@ -1350,24 +1562,36 @@ class RenderManager(QWidget):
       if file:
           self.houdini_versions.addItem(file)
           self.houdini_versions.setCurrentText(file)
-          self.log(f"Выбран hython.exe: {file}")
+          self.log_t("hython_selected", file=file)
 
   def check_environment(self):
       path = self.houdini_versions.currentText()
       if os.path.exists(path):
-          self.log(f"✅ Houdini найден: {path}")
+          self.log_t("houdini_found", path=path)
       else:
-          self.log(f"❌ Houdini не найден: {path}")
+          self.log_t("houdini_not_found", path=path)
 
       from telegram_notifier import check_preview_dependencies
 
       ok, msg, hint = check_preview_dependencies()
       if ok:
-          self.log("✅ Зависимости Telegram превью (Pillow) установлены")
+          self.log_t("preview_deps_ok")
       else:
-          self.log(f"❌ Telegram превью: {msg}")
+          self.log_t("preview_deps_fail", msg=msg)
           if hint:
               self.log(f"   {hint}")
+
+  def _sync_zone1_layout(self):
+      """Let hython path field shrink so zone 1 buttons fit without a scrollbar."""
+      if not hasattr(self, "houdini_versions"):
+          return
+      min_chars = 4 if self.current_language == "ru" else 6
+      self.houdini_versions.setMinimumContentsLength(min_chars)
+      if hasattr(self, "_zone1_btns_widget"):
+          self._zone1_btns_widget.adjustSize()
+      self.houdini_versions.updateGeometry()
+      if hasattr(self, "ui_elements") and "group1" in self.ui_elements:
+          self.ui_elements["group1"].updateGeometry()
 
   def switch_language(self):
       if self.current_language == "en":
@@ -1383,6 +1607,8 @@ class RenderManager(QWidget):
       t = TRANSLATIONS[self.current_language]
       
       self.setWindowTitle(t["title"])
+      if "houdini_version_label" in self.ui_elements:
+          self.ui_elements["houdini_version_label"].setText(t["houdini_version"])
       self.ui_elements["group1"].setTitle(t["zone1"])
       self.ui_elements["group2"].setTitle(t["zone2"])
       self.ui_elements["group3"].setTitle(t["zone3"])
@@ -1390,6 +1616,11 @@ class RenderManager(QWidget):
       self.ui_elements["group5"].setTitle(t["zone5"])
       if hasattr(self, "main_splitter"):
           self.main_splitter.configure_handles(t["splitter_queue_resize"])
+      if hasattr(self, "queue_splitter"):
+          self.queue_splitter.configure_handles(t["splitter_queue_resize"])
+      if hasattr(self, "top_zones_splitter"):
+          self.top_zones_splitter.configure_handles(t["splitter_zones_resize"])
+      self._update_log_position_btn()
       self._apply_header_logo(find_bundled_file("logo_met2.png"))
 
       self.ui_elements["browse_btn"].setText(t["browse"])
@@ -1422,8 +1653,22 @@ class RenderManager(QWidget):
       self.ui_elements["duplicate_btn"].setText(t["duplicate"])
       
       self.queue_table.setHorizontalHeaderLabels(t["queue_headers"])
+      self.queue_model.set_headers(t["queue_headers"])
+      if hasattr(self, "workflow_guide"):
+          self.workflow_guide.setText(t["workflow_html"])
+      for key, tip_key in (
+          ("group2", "zone2_tip"),
+          ("group3", "zone3_tip"),
+          ("group4", "zone4_tip"),
+          ("group5", "zone5_tip"),
+      ):
+          if key in self.ui_elements:
+              self.ui_elements[key].setToolTip(t[tip_key])
       self.update_hip_scan_label()
       self.update_rop_count_label()
+      self._sync_zone1_layout()
+      if self.queue_thread and self.queue_thread.isRunning():
+          self._update_eta_displays()
 
   def get_active_hip_path(self):
       current = self.hip_list.currentItem()
@@ -1499,35 +1744,16 @@ class RenderManager(QWidget):
       path = normalize_output_template(path.strip()) if path else ""
       self._set_path_cell(row, col, path, hip_file=hip, op_name=op_name)
       if col == COL_OUTPUT and path:
-          self.log(f"Путь вывода рендера: {path}")
+          self.log_t("output_path_set", path=path)
       if self.initialized:
           self.save_state()
 
   def _set_path_cell(self, row, col, path, hip_file=None, op_name=None):
       """Update path cell display without treating it as user edit."""
-      item = self.queue_table.item(row, col)
-      if not item:
-          return
-      path = (path or "").strip()
-      if col == COL_OUTPUT:
-          if hip_file is None:
-              hip_item = self.queue_table.item(row, COL_HIP)
-              hip_file = self._get_cell_path(hip_item)
-          if op_name is None:
-              rop_item = self.queue_table.item(row, COL_ROP)
-              op_name = rop_item.text() if rop_item else None
-          tip = path_tooltip(path, hip_file, op_name)
-      else:
-          tip = path or ""
       self._queue_cell_edit_guard = True
-      self.queue_table.blockSignals(True)
       try:
-          item.setData(FULL_PATH_ROLE, path)
-          if tip:
-              item.setToolTip(tip)
-          item.setText(self._path_display(path))
+          self.queue_model.set_path(row, col, path, hip_file=hip_file, op_name=op_name)
       finally:
-          self.queue_table.blockSignals(False)
           self._queue_cell_edit_guard = False
 
   def _queue_has_rop(self, hip_path, rop_name):
@@ -1545,9 +1771,7 @@ class RenderManager(QWidget):
 
   def set_all_queue_enabled(self, enabled):
       for row in range(self.queue_table.rowCount()):
-          item = self.queue_table.item(row, 0)
-          if item:
-              apply_toggle_cell_style(item, enabled)
+          self.queue_model.set_enabled(row, enabled)
       if self.initialized:
           self.save_state()
 
@@ -1558,18 +1782,18 @@ class RenderManager(QWidget):
   def open_selected_hip(self):
       row = self._get_selected_queue_row()
       if row is None:
-          self.log("⚠️ Выберите строку в очереди.")
+          self.log_t("select_queue_row")
           return
       path = self._get_cell_path(self.queue_table.item(row, COL_HIP))
       if path and os.path.isfile(path):
           os.startfile(path)
       else:
-          self.log(f"⚠️ HIP не найден: {path}")
+          self.log_t("hip_not_found", path=path)
 
   def open_selected_output_folder(self):
       row = self._get_selected_queue_row()
       if row is None:
-          self.log("⚠️ Выберите строку в очереди.")
+          self.log_t("select_queue_row")
           return
       path = self._get_cell_path(self.queue_table.item(row, COL_OUTPUT))
       hip = self._get_cell_path(self.queue_table.item(row, COL_HIP))
@@ -1585,97 +1809,18 @@ class RenderManager(QWidget):
       if folder and os.path.isdir(folder):
           os.startfile(folder)
       else:
-          self.log(f"⚠️ Папка не найдена: {folder}")
+          self.log_t("folder_not_found", folder=folder)
 
   def _read_base_resolution(self, row):
-      """Read base (unscaled) resolution from UserRole only."""
-      sx = self.queue_table.item(row, 7)
-      sy = self.queue_table.item(row, 8)
-      base_x = base_y = None
-      if sx:
-          raw = sx.data(BASE_SIZE_X_ROLE)
-          if raw is not None and str(raw).strip() != "":
-              base_x = max(1, int(float(raw)))
-      if sy:
-          raw = sy.data(BASE_SIZE_Y_ROLE)
-          if raw is not None and str(raw).strip() != "":
-              base_y = max(1, int(float(raw)))
-      return base_x, base_y
-
-  def _sanitize_saved_base(self, entry, base_x, base_y):
-      """Fix configs where size_x_base accidentally stored the scaled size."""
-      resize_pct = self._parse_resize_pct(entry.get("resize", "100"))
-      if abs(resize_pct - 100.0) < 0.001:
-          return base_x, base_y
-      try:
-          display_x = int(float(entry.get("size_x", base_x)))
-          display_y = int(float(entry.get("size_y", base_y)))
-      except (TypeError, ValueError):
-          return base_x, base_y
-      expected_x = max(1, int(base_x * resize_pct / 100))
-      expected_y = max(1, int(base_y * resize_pct / 100))
-      if abs(display_x - expected_x) <= max(2, int(expected_x * 0.05)) and abs(
-          display_y - expected_y
-      ) <= max(2, int(expected_y * 0.05)):
-          return base_x, base_y
-      recovered_x = max(1, int(round(display_x * 100.0 / resize_pct)))
-      recovered_y = max(1, int(round(display_y * 100.0 / resize_pct)))
-      if recovered_x > base_x * 1.2 or recovered_y > base_y * 1.2:
-          return recovered_x, recovered_y
-      return base_x, base_y
-
-  def _legacy_base_from_entry(self, entry):
-      """One-time recovery of base size from old configs without size_x_base."""
-      resize_pct = self._parse_resize_pct(entry.get("resize", "100"))
-      try:
-          sx = int(float(entry.get("size_x", 1920) or 1920))
-          sy = int(float(entry.get("size_y", 1080) or 1080))
-      except (TypeError, ValueError):
-          return 1920, 1080
-      if abs(resize_pct - 100.0) > 0.001:
-          return (
-              max(1, int(round(sx * 100.0 / resize_pct))),
-              max(1, int(round(sy * 100.0 / resize_pct))),
-          )
-      return max(1, sx), max(1, sy)
-
-  def _restore_resolution_columns(self, row, entry):
-      """Restore resize/size columns without writing scaled values into base role."""
-      try:
-          resize_pct = self._parse_resize_pct(entry.get("resize", "100"))
-          resize_text = str(entry.get("resize", "100")).strip()
-          if resize_text and not resize_text.endswith("%"):
-              resize_text = f"{resize_pct:g}%"
-
-          if entry.get("size_x_base") not in (None, ""):
-              base_x = max(1, int(float(entry["size_x_base"])))
-              base_y = max(1, int(float(entry.get("size_y_base", entry.get("size_y", 1080)))))
-              base_x, base_y = self._sanitize_saved_base(entry, base_x, base_y)
-          else:
-              base_x, base_y = self._legacy_base_from_entry(entry)
-
-          self._resize_update_guard = True
-          self.queue_table.blockSignals(True)
-          try:
-              self.queue_table.setItem(row, 9, QTableWidgetItem(resize_text))
-              self.queue_table.setItem(row, 7, QTableWidgetItem(""))
-              self.queue_table.setItem(row, 8, QTableWidgetItem(""))
-              self._set_base_resolution(row, base_x, base_y)
-          finally:
-              self.queue_table.blockSignals(False)
-              self._resize_update_guard = False
-
-          self._apply_resize_display(row, base_x=base_x, base_y=base_y)
-      except (TypeError, ValueError):
-          pass
+      return self.queue_model.read_base_resolution(row)
 
   def _set_base_resolution(self, row, base_x, base_y):
-      sx = self.queue_table.item(row, 7)
-      sy = self.queue_table.item(row, 8)
-      if sx:
-          sx.setData(BASE_SIZE_X_ROLE, str(int(base_x)))
-      if sy:
-          sy.setData(BASE_SIZE_Y_ROLE, str(int(base_y)))
+      self.queue_model.set_resize(
+          row,
+          self.queue_model.get_text(row, 9) or "100%",
+          base_x=base_x,
+          base_y=base_y,
+      )
 
   def _parse_resize_pct(self, resize_text):
       if not resize_text:
@@ -1687,51 +1832,256 @@ class RenderManager(QWidget):
           return 100.0
 
   def _resolve_render_size(self, row, base_x=None, base_y=None):
-      """Base from UserRole + Resize % -> final resolution. Never derive base from display text."""
-      rz = self.queue_table.item(row, 9)
-      resize_pct = self._parse_resize_pct(rz.text() if rz else "100")
-      if base_x is None or base_y is None:
-          role_x, role_y = self._read_base_resolution(row)
-          base_x = base_x if base_x is not None else (role_x or 1920)
-          base_y = base_y if base_y is not None else (role_y or 1080)
-      self._set_base_resolution(row, base_x, base_y)
-      actual_x = max(1, int(base_x * resize_pct / 100))
-      actual_y = max(1, int(base_y * resize_pct / 100))
-      return base_x, base_y, resize_pct, actual_x, actual_y
+      return self.queue_model.resolve_render_size(row, base_x=base_x, base_y=base_y)
 
   def _apply_resize_display(self, row, base_x=None, base_y=None):
-      """Update Size X/Y display cells; base resolution stays in UserRole."""
-      base_x, base_y, resize_pct, actual_x, actual_y = self._resolve_render_size(
-          row, base_x=base_x, base_y=base_y
-      )
-      sx = self.queue_table.item(row, 7)
-      sy = self.queue_table.item(row, 8)
-      self._resize_update_guard = True
-      self.queue_table.blockSignals(True)
-      try:
-          if sx:
-              sx.setText(str(actual_x))
-          if sy:
-              sy.setText(str(actual_y))
-      finally:
-          self.queue_table.blockSignals(False)
-          self._resize_update_guard = False
-      return base_x, base_y, resize_pct, actual_x, actual_y
+      if base_x is not None or base_y is not None:
+          bx, by = self.queue_model.read_base_resolution(row)
+          self.queue_model.set_resize(
+              row,
+              self.queue_model.get_text(row, 9) or "100%",
+              base_x=base_x if base_x is not None else bx,
+              base_y=base_y if base_y is not None else by,
+          )
+      return self.queue_model.resolve_render_size(row)
 
-  def _update_render_progress(self, cur, total, row, status):
+  def _update_global_progress(self, cur, total, row, status):
       t = TRANSLATIONS[self.current_language]
-      if not status or total <= 0:
+      if total <= 0 or not status:
           self.render_progress_label.setText(t["render_progress_idle"])
+          self.render_progress_bar.setValue(0)
+          self.render_progress_bar.setFormat("%p%")
           self.setWindowTitle(t["title"])
           return
-      hip_item = self.queue_table.item(row, COL_HIP)
-      rop_item = self.queue_table.item(row, COL_ROP)
-      hip = os.path.basename(self._get_cell_path(hip_item)) if hip_item else "?"
-      rop = rop_item.text() if rop_item else "?"
+
+      hip = "?"
+      rop = "?"
+      if row >= 0:
+          hip_path = self.queue_model.get_path(row, COL_HIP)
+          if hip_path:
+              hip = os.path.basename(hip_path)
+          rop = self.queue_model.get_text(row, COL_ROP) or "?"
+
+      pct = 0
+      if status == "Running" and self._render_job_total > 0:
+          pct = int(
+              ((self._jobs_done + self._active_render_ratio) / self._render_job_total) * 100
+          )
+          pct = max(0, min(100, pct))
+      elif self._render_job_total > 0:
+          pct = int((self._jobs_done / self._render_job_total) * 100)
+
+      self.render_progress_bar.setValue(pct)
       self.render_progress_label.setText(
-          t["render_progress"].format(cur=cur, total=total, hip=hip, rop=rop, status=status)
+          t["render_progress"].format(
+              cur=cur, total=total, hip=hip, rop=rop, status=status, pct=pct
+          )
       )
       self.setWindowTitle(f"{t['title']} — {status} ({cur}/{total})")
+
+  def _apply_row_progress(self, row, ratio):
+      try:
+          ratio = max(0.0, min(1.0, float(ratio)))
+      except (TypeError, ValueError):
+          ratio = 0.0
+      meta = self._row_eta_meta.get(row, {})
+      if meta.get("skip") and meta.get("work_total", 0) > 0:
+          ratio = max(self._row_work_ratio.get(row, 0.0), ratio)
+          self._row_work_ratio[row] = ratio
+      self._active_render_ratio = ratio
+      self._set_status_render_progress(row, ratio)
+      cur = min(self._jobs_done + 1, self._render_job_total) if self._render_job_total else 1
+      self._update_global_progress(cur, self._render_job_total, row, "Running")
+
+  def _on_frame_rendered(self, row, work_done, work_total, frame_seconds=-1.0):
+      """Update ETA when a frame finishes; use Redshift per-frame total when available."""
+      try:
+          work_done = int(work_done)
+          work_total = int(work_total)
+      except (TypeError, ValueError):
+          return
+      if work_total <= 0 or work_done <= 0:
+          return
+      prev = self._row_work_done.get(row, 0)
+      if work_done <= prev:
+          return
+      now = time.monotonic()
+      frame_sec = None
+      try:
+          if frame_seconds is not None and float(frame_seconds) > 0:
+              frame_sec = float(frame_seconds)
+      except (TypeError, ValueError):
+          frame_sec = None
+      if frame_sec is None:
+          start = self._row_render_start.get(row)
+          if start is not None:
+              if prev > 0:
+                  frame_sec = now - self._row_last_frame_mono.get(row, start)
+              else:
+                  frame_sec = now - start
+      if frame_sec and frame_sec > 0:
+          samples = self._row_frame_seconds.setdefault(row, [])
+          samples.append(frame_sec)
+      self._row_last_frame_mono[row] = now
+      self._row_work_done[row] = work_done
+      meta = self._row_eta_meta.setdefault(row, {})
+      meta["work_total"] = work_total
+      self._update_eta_displays()
+
+  def _sec_per_frame_estimate(self, row):
+      work_done = self._row_work_done.get(row, 0)
+      meta = self._row_eta_meta.get(row, {})
+      work_total = meta.get("work_total", 0)
+      if work_done <= 0 or work_total <= 0:
+          return None
+      times = self._row_frame_seconds.get(row, [])
+      if not times:
+          return None
+      last = times[-1]
+      if len(times) == 1:
+          return last
+      avg = sum(times) / len(times)
+      return 0.65 * avg + 0.35 * last
+
+  def _remaining_current_job_seconds(self):
+      cur = self._progress_ui_row
+      if cur < 0:
+          return None
+      meta = self._row_eta_meta.get(cur, {})
+      work_done = self._row_work_done.get(cur, 0)
+      work_total = meta.get("work_total", 0)
+      if work_total > 0 and work_done >= work_total:
+          return 0
+      if work_done <= 0:
+          return None
+      sec_per = self._sec_per_frame_estimate(cur)
+      if not sec_per or sec_per <= 0:
+          return None
+      return sec_per * (work_total - work_done)
+
+  def _avg_job_seconds(self):
+      if not self._job_duration_samples:
+          return None
+      return sum(self._job_duration_samples) / len(self._job_duration_samples)
+
+  def _estimate_job_seconds(self, row):
+      meta = self._row_eta_meta.get(row, {})
+      work = meta.get("work_total")
+      if work is not None and work <= 0:
+          return 1.0
+      avg = self._avg_job_seconds()
+      if avg and avg > 0:
+          return avg
+      cur = self._progress_ui_row
+      if cur >= 0:
+          sec_per = self._sec_per_frame_estimate(cur)
+          if sec_per and sec_per > 0 and work:
+              return sec_per * work
+      return None
+
+  def _eta_tip(self, seconds):
+      finish = finish_clock_from_now(seconds)
+      if not finish:
+          return ""
+      remaining = format_remaining_seconds(seconds)
+      return TRANSLATIONS[self.current_language]["eta_finish_tip"].format(
+          remaining=remaining, finish=finish
+      )
+
+  def _set_row_eta(self, row, seconds, pending=False):
+      if seconds is None or seconds <= 0:
+          text = "..." if pending else "--"
+          self.queue_model.set_eta_display(row, text)
+          return
+      self.queue_model.set_eta_display(
+          row,
+          format_eta_finish_cell(seconds),
+          self._eta_tip(seconds),
+      )
+
+  def _update_eta_displays(self):
+      batch = self._active_render_rows
+      if not batch or not self.queue_thread or not self.queue_thread.isRunning():
+          return
+
+      cur = self._progress_ui_row
+      try:
+          cur_idx = batch.index(cur) if cur in batch else -1
+      except ValueError:
+          cur_idx = -1
+      cur_remaining = self._remaining_current_job_seconds()
+
+      batch_set = set(batch)
+      for row in range(self.queue_table.rowCount()):
+          if row not in batch_set:
+              self.queue_model.set_eta_display(row, "--")
+              continue
+
+          status = self.queue_model.get_text(row, COL_STATUS)
+          if status in ("Completed", "Skipped", "Failed", "Stopped"):
+              self.queue_model.set_eta_display(row, "--")
+              continue
+
+          try:
+              idx = batch.index(row)
+          except ValueError:
+              self.queue_model.set_eta_display(row, "--")
+              continue
+
+          if cur_idx < 0:
+              self._set_row_eta(row, None, pending=True)
+              continue
+
+          if idx < cur_idx:
+              self.queue_model.set_eta_display(row, "--")
+              continue
+
+          if row == cur:
+              self._set_row_eta(row, cur_remaining, pending=True)
+              continue
+
+          wait = cur_remaining or 0
+          for j in range(cur_idx + 1, idx):
+              est = self._estimate_job_seconds(batch[j])
+              if est:
+                  wait += est
+          est_self = self._estimate_job_seconds(row)
+          if est_self:
+              wait += est_self
+          self._set_row_eta(row, wait if wait > 0 else None, pending=True)
+
+  def _clear_all_eta_displays(self):
+      for row in range(self.queue_table.rowCount()):
+          self.queue_model.set_eta_display(row, "--")
+
+  def _start_eta_tracking(self, queue_data):
+      self._active_render_rows = [item["row"] for item in queue_data]
+      self._row_render_start = {}
+      self._job_duration_samples = []
+      self._row_eta_meta = {}
+      self._row_work_ratio = {}
+      self._row_work_done = {}
+      self._row_last_frame_mono = {}
+      self._row_frame_seconds = {}
+      for item in queue_data:
+          row = item["row"]
+          skip = item["skip_val"] == "1"
+          work_total = item.get(
+              "work_total", item["end_frame"] - item["start_frame"] + 1
+          )
+          self._row_eta_meta[row] = {"skip": skip, "work_total": work_total}
+      self._clear_all_eta_displays()
+
+  def _stop_eta_tracking(self):
+      self._active_render_rows = []
+      self._row_render_start = {}
+      self._job_duration_samples = []
+      self._row_eta_meta = {}
+      self._row_work_ratio = {}
+      self._row_work_done = {}
+      self._row_last_frame_mono = {}
+      self._row_frame_seconds = {}
+      self._clear_all_eta_displays()
 
   def update_rop_count_label(self):
       t = TRANSLATIONS[self.current_language]
@@ -1740,47 +2090,10 @@ class RenderManager(QWidget):
       self.rop_count_label.setText(t["rop_count"].format(shown=shown, total=total))
 
   def _populate_queue_row(self, row, entry=None, rop_name=None, rop_type=None, rop_data=None, hip_path=None):
-      """Fill one queue table row from a saved entry or new ROP data."""
+      """Fill one queue row via QAbstractTableModel."""
       if entry is not None:
-          for col, key in enumerate(QUEUE_COLUMN_KEYS):
-              raw_val = entry.get(key, "")
-              if col in (0, 6):
-                  checked = normalize_toggle_value(raw_val, "1" if col == 0 else "0") == "1"
-                  if col == 0 and (raw_val is None or raw_val == ""):
-                      checked = True
-                  self.queue_table.setItem(row, col, create_toggle_item(checked))
-              elif col == COL_HIP:
-                  hip_val = str(raw_val or "")
-                  self.queue_table.setItem(
-                      row, col, self._make_path_item(hip_val, editable=False, hip_file=hip_val)
-                  )
-              elif col == COL_OUTPUT:
-                  hip_val = str(entry.get("hip", "") or "")
-                  rop_val = str(entry.get("rop", "") or "")
-                  self.queue_table.setItem(
-                      row, col,
-                      self._make_path_item(
-                          str(raw_val or ""), editable=True, hip_file=hip_val, op_name=rop_val
-                      ),
-                  )
-              elif col in (7, 8, 9):
-                  continue
-              else:
-                  text = "" if raw_val is None else str(raw_val)
-                  item = QTableWidgetItem(text)
-                  if col not in (4, 5, 10, 12):
-                      item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                  self.queue_table.setItem(row, col, item)
-                  if col == COL_STATUS:
-                      apply_status_style(item, text)
-          self._restore_resolution_columns(row, entry)
+          self.queue_model.insert_entry(row, entry)
           return
-
-      enabled_default = True
-      skip_default = bool(rop_data.get("skip_existing")) if rop_data else False
-      self.queue_table.setItem(row, 0, create_toggle_item(enabled_default))
-      self.queue_table.setItem(row, 6, create_toggle_item(skip_default))
-
       if not hip_path:
           if rop_data and rop_data.get("hip"):
               hip_path = rop_data.get("hip")
@@ -1788,42 +2101,29 @@ class RenderManager(QWidget):
               hip_path = self.last_scanned_hip
           else:
               hip_path = self.get_active_hip_path() or ""
-      self.queue_table.setItem(row, COL_HIP, self._make_path_item(hip_path, editable=False, hip_file=hip_path))
-      self.queue_table.setItem(row, COL_ROP, self._make_readonly_item(rop_name or ""))
-      self.queue_table.setItem(row, 3, self._make_readonly_item(rop_type or ""))
-
-      start_frame = str(rop_data.get("start_frame", "1")) if rop_data else "1"
-      end_frame = str(rop_data.get("end_frame", "100")) if rop_data else "100"
-      self.queue_table.setItem(row, 4, QTableWidgetItem(start_frame))
-      self.queue_table.setItem(row, 5, QTableWidgetItem(end_frame))
-
-      size_x = str(rop_data.get("size_x", "1920")) if rop_data else "1920"
-      size_y = str(rop_data.get("size_y", "1080")) if rop_data else "1080"
-      resize_val = str(entry.get("resize", "100")) if entry else "100"
-      if not resize_val.endswith("%"):
-          resize_val = f"{resize_val}%"
-      self.queue_table.setItem(row, 7, QTableWidgetItem(size_x))
-      self.queue_table.setItem(row, 8, QTableWidgetItem(size_y))
-      self.queue_table.setItem(row, 9, QTableWidgetItem(resize_val))
-      self._set_base_resolution(row, size_x, size_y)
-      self._apply_resize_display(row)
-
-      output_path = (rop_data.get("output_path", "") if rop_data else "").strip()
-      self.queue_table.setItem(
-          row, COL_OUTPUT,
-          self._make_path_item(output_path, editable=True, hip_file=hip_path, op_name=rop_name or ""),
-      )
-      status_item = self._make_readonly_item("Queued")
-      apply_status_style(status_item, "Queued")
-      self.queue_table.setItem(row, COL_STATUS, status_item)
-      self.queue_table.setItem(row, 12, QTableWidgetItem("0"))
-      self.queue_table.setItem(row, 13, self._make_readonly_item(""))
-      self.queue_table.setItem(row, 14, self._make_readonly_item(""))
-      self.queue_table.setItem(row, 15, self._make_readonly_item("--"))
+      new_entry = _empty_row()
+      new_entry["enabled"] = "1"
+      new_entry["skip"] = "1" if (rop_data and rop_data.get("skip_existing")) else "0"
+      new_entry["hip"] = hip_path
+      new_entry["rop"] = rop_name or ""
+      new_entry["type"] = rop_type or ""
+      new_entry["start_frame"] = str(rop_data.get("start_frame", "1")) if rop_data else "1"
+      new_entry["end_frame"] = str(rop_data.get("end_frame", "100")) if rop_data else "100"
+      sx = str(rop_data.get("size_x", "1920")) if rop_data else "1920"
+      sy = str(rop_data.get("size_y", "1080")) if rop_data else "1080"
+      new_entry["size_x_base"] = sx
+      new_entry["size_y_base"] = sy
+      new_entry["resize"] = "100%"
+      new_entry["output_path"] = (rop_data.get("output_path", "") if rop_data else "").strip()
+      new_entry["status"] = "Queued"
+      import telegram_notifier as tg
+      tg.reload_config()
+      new_entry["send_mp4"] = "1" if tg.SEND_MP4_ON_COMPLETE else "0"
+      self.queue_model.insert_entry(row, new_entry)
 
   def save_settings(self):
       self.save_state()
-      self.log("Настройки сохранены.")
+      self.log_t("settings_saved")
 
   def on_hip_selection_changed(self):
       if self.hip_list.selectedItems():
@@ -1891,31 +2191,18 @@ class RenderManager(QWidget):
       if self.queue_thread and self.queue_thread.isRunning():
           active = any(j.get("row") == row for j in getattr(self, "_render_jobs", []))
           if active:
-              self.log("⚠️ Нельзя сбросить статус строки, которая сейчас рендерится.")
+              self.log_t("cant_reset_running")
               return
-      status_item = self._make_readonly_item("Queued")
-      apply_status_style(status_item, "Queued")
-      self.queue_table.setItem(row, COL_STATUS, status_item)
-      self._set_status_render_progress(row, None)
-      for col in (13, 14):
-          item = self.queue_table.item(row, col)
-          if item:
-              item.setText("")
-      duration_item = self.queue_table.item(row, 15)
-      if duration_item:
-          duration_item.setText("--")
+      self.queue_model.reset_status_row(row)
       if self.initialized:
           self.save_state()
-      rop_item = self.queue_table.item(row, COL_ROP)
-      rop_name = rop_item.text() if rop_item else "?"
-      self.log(f"✓ Статус сброшен на Queued: {rop_name}")
+      rop_name = self.queue_model.get_text(row, COL_ROP) or "?"
+      self.log_t("status_reset", rop_name=rop_name)
 
   def _context_set_enabled(self, row, enabled):
-      item = self.queue_table.item(row, 0)
-      if item:
-          apply_toggle_cell_style(item, enabled)
-          if self.initialized:
-              self.save_state()
+      self.queue_model.set_enabled(row, enabled)
+      if self.initialized:
+          self.save_state()
 
   def on_hip_context_menu(self, pos):
       item = self.hip_list.itemAt(pos)
@@ -1937,7 +2224,7 @@ class RenderManager(QWidget):
           self.start_btn.setEnabled(False)
           set_disabled_style(self.start_btn)
           return
-      if self.queue_table.rowCount() > 0:
+      if self.queue_model.rowCount() > 0:
           self.start_btn.setEnabled(True)
           set_next_style(self.start_btn)
       else:
@@ -1954,7 +2241,7 @@ class RenderManager(QWidget):
   def add_to_queue(self):
       selected_rops = self.rop_list.selectedItems()
       if not selected_rops:
-          self.log("⚠️ Не выбраны ROP для добавления в очередь.")
+          self.log_t("no_rops_selected")
           return
 
       added = 0
@@ -1968,24 +2255,105 @@ class RenderManager(QWidget):
               continue
           rop_data = next((r for r in self.all_rops if r["name"] == rop_name), None)
           row = self.queue_table.rowCount()
-          self.queue_table.insertRow(row)
           self._populate_queue_row(
               row, rop_name=rop_name, rop_type=rop_type, rop_data=rop_data, hip_path=hip_path
           )
-          out_item = self.queue_table.item(row, COL_OUTPUT)
-          if out_item and not self._get_cell_path(out_item):
-              self.log(
-                  f"⚠️ {rop_name}: {TRANSLATIONS[self.current_language]['path_empty']}"
+          if not self.queue_model.get_path(row, COL_OUTPUT):
+              self.log_t(
+                  "rop_path_empty",
+                  rop_name=rop_name,
+                  detail=TRANSLATIONS[self.current_language]["path_empty"],
               )
           added += 1
 
-      self.log(f"Добавлено {added} ROP(ов) в очередь.")
+      self.log_t("rops_added", count=added)
       self.update_start_button()
       self.save_state()
 
+  def _splitter_state_hex(self, splitter):
+      try:
+          return splitter.saveState().toHex().data().decode()
+      except Exception:
+          return ""
+
+  def _restore_splitter_state_hex(self, splitter, hex_state):
+      if not hex_state:
+          return
+      try:
+          splitter.restoreState(QByteArray.fromHex(hex_state.encode()))
+      except Exception as e:
+          self.log_t("splitter_restore_error", e=e)
+
+  def _restore_layout_splitters(self):
+      if not hasattr(self, "main_splitter"):
+          return
+      self._restore_splitter_state_hex(
+          self.main_splitter, self._splitter_states.get(self.log_position)
+      )
+      self._restore_splitter_state_hex(
+          self.queue_splitter, self._splitter_states.get("queue")
+      )
+      self._restore_splitter_state_hex(
+          self.top_zones_splitter, self._splitter_states.get("top_zones")
+      )
+
+  def _apply_layout_resize_policies(self):
+      log_right = self.log_position == "right"
+      if hasattr(self, "log_panel"):
+          self.log_panel.setMinimumWidth(80 if log_right else 0)
+          self.log_panel.setSizePolicy(
+              QSizePolicy.Policy.Expanding,
+              QSizePolicy.Policy.Expanding,
+          )
+      if hasattr(self, "queue_splitter"):
+          self.queue_splitter.setSizePolicy(
+              QSizePolicy.Policy.Expanding,
+              QSizePolicy.Policy.Expanding,
+          )
+      if hasattr(self, "main_splitter"):
+          self.main_splitter.setStretchFactor(0, 4 if log_right else 1)
+          self.main_splitter.setStretchFactor(1, 1)
+
+  def _update_log_position_btn(self):
+      if not hasattr(self, "log_position_btn"):
+          return
+      t = TRANSLATIONS[self.current_language]
+      key = "log_position_right" if self.log_position == "right" else "log_position_bottom"
+      self.log_position_btn.setText(t[key])
+      self.log_position_btn.setToolTip(t["log_position_tip"])
+
+  def toggle_log_position(self):
+      self.set_log_position("right" if self.log_position == "bottom" else "bottom")
+
+  def set_log_position(self, position, save=True):
+      if position not in ("bottom", "right"):
+          position = "bottom"
+      if hasattr(self, "main_splitter"):
+          current = self._splitter_state_hex(self.main_splitter)
+          if current:
+              self._splitter_states[self.log_position] = current
+          queue_state = self._splitter_state_hex(self.queue_splitter)
+          if queue_state:
+              self._splitter_states["queue"] = queue_state
+      self.log_position = position
+      orient = (
+          Qt.Orientation.Vertical
+          if position == "bottom"
+          else Qt.Orientation.Horizontal
+      )
+      self.main_splitter.setOrientation(orient)
+      self._apply_layout_resize_policies()
+      self._restore_splitter_state_hex(
+          self.main_splitter, self._splitter_states.get(position)
+      )
+      self._update_log_position_btn()
+      QTimer.singleShot(0, self.updateGeometry)
+      if save and self.initialized:
+          self.save_state()
+
   def clear_log(self):
       self.log_output.clear()
-      self.log("Лог очищен.")
+      self.log_t("log_cleared")
 
   def save_state(self):
       # Prevent saving during initialization
@@ -2031,11 +2399,26 @@ class RenderManager(QWidget):
                   data["ui"]["x"] = self.x()
                   data["ui"]["y"] = self.y()
                   
-                  splitter_hex = self.main_splitter.saveState().toHex().data().decode()
+                  splitter_hex = self._splitter_state_hex(self.main_splitter)
                   if splitter_hex:
                       data["splitter_state"] = splitter_hex
+                      if "ui" not in data:
+                          data["ui"] = {}
+                      key = (
+                          "splitter_state_bottom"
+                          if self.log_position == "bottom"
+                          else "splitter_state_right"
+                      )
+                      data["ui"][key] = splitter_hex
+                      data["ui"]["log_position"] = self.log_position
+                      queue_hex = self._splitter_state_hex(self.queue_splitter)
+                      if queue_hex:
+                          data["ui"]["queue_splitter_state"] = queue_hex
+                      top_zones_hex = self._splitter_state_hex(self.top_zones_splitter)
+                      if top_zones_hex:
+                          data["ui"]["top_zones_splitter_state"] = top_zones_hex
           except Exception as e:
-              self.log(f"Warning: Could not save geometry/splitter: {e}")
+              self.log_t("save_geom_error", e=e)
           
           # Save queue table column widths
           try:
@@ -2043,85 +2426,101 @@ class RenderManager(QWidget):
                   data["ui"] = {}
               data["ui"]["column_widths"] = [self.queue_table.columnWidth(i) for i in range(self.queue_table.columnCount())]
           except Exception as e:
-              self.log(f"Warning: Could not save column widths: {e}")
+              self.log_t("save_columns_error", e=e)
 
           # Write config with explicit encoding
           with open(CONFIG_FILE, "w", encoding="utf-8") as f:
               json.dump(data, f, indent=4, ensure_ascii=False)
       except Exception as e:
-          self.log(f"Error saving state: {e}")
+          self.log_t("save_state_error", e=e)
+
+  def _sync_hython_config(self):
+      """Write current hython combo value to config.json (run_render reads it from disk)."""
+      path = self.houdini_versions.currentText().strip()
+      try:
+          data = {}
+          if os.path.exists(CONFIG_FILE):
+              with open(CONFIG_FILE, encoding="utf-8") as f:
+                  data = json.load(f)
+          data["hython_path"] = path
+          with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+              json.dump(data, f, indent=4, ensure_ascii=False)
+      except Exception as e:
+          self.log_t("hython_save_fail", e=e)
+      return path
 
   def start_render(self):
-      if self.queue_table.rowCount() == 0:
-          self.log("⚠️ Очередь рендера пуста.")
+      if self.queue_model.rowCount() == 0:
+          self.log_t("queue_empty")
           return
       if self.queue_thread and self.queue_thread.isRunning():
-          self.log("⚠️ Очередь уже выполняется.")
+          self.log_t("queue_running")
           return
 
-      self.log("▶️ Начинается рендер очереди...")
-      self.stop_btn.setEnabled(True)
-      set_delete_style(self.stop_btn)
-      self.start_btn.setEnabled(False)
-      set_disabled_style(self.start_btn)
+      hython_path = self._sync_hython_config()
+      if not hython_path or not os.path.exists(hython_path):
+          self.log_t(
+              "hython_missing",
+              path=hython_path or log_msg(self.current_language, "hython_not_selected"),
+          )
+          self.log_t("hython_select_hint")
+          return
 
       queue_data = []
-      for row in range(self.queue_table.rowCount()):
-          enabled_item = self.queue_table.item(row, 0)
-          hip_item = self.queue_table.item(row, 1)
-          rop_item = self.queue_table.item(row, 2)
-          type_item = self.queue_table.item(row, 3)
-          start_item = self.queue_table.item(row, 4)
-          end_item = self.queue_table.item(row, 5)
-          skip_item = self.queue_table.item(row, 6)
-          size_x_item = self.queue_table.item(row, 7)
-          size_y_item = self.queue_table.item(row, 8)
-          resize_item = self.queue_table.item(row, 9)
-          output_item = self.queue_table.item(row, 10)
-          send2bot_item = self.queue_table.item(row, 12)
-
-          enabled_val = enabled_item.data(Qt.UserRole) if enabled_item and enabled_item.data(Qt.UserRole) is not None else "1"
-          if enabled_val == "0":
-              self.log(f"⏭️ Строка {row+1}: отключена, пропускаю.")
+      for row in range(self.queue_model.rowCount()):
+          entry = self.queue_model.row_to_entry(row)
+          if not is_toggle_checked_value(entry.get("enabled")):
+              self.log_t("row_disabled", row=row + 1)
               continue
 
-          hip_file = self._get_cell_path(hip_item)
-          rop_name = rop_item.text() if rop_item else ""
-          rop_type = type_item.text() if type_item else ""
-          start_frame_str = start_item.text() if start_item else "1"
-          end_frame_str = end_item.text() if end_item else "100"
-          skip_val = skip_item.data(Qt.UserRole) if skip_item and skip_item.data(Qt.UserRole) is not None else "0"
+          hip_file = str(entry.get("hip", "") or "").strip()
+          rop_name = str(entry.get("rop", "") or "").strip()
+          rop_type = str(entry.get("type", "") or "").strip()
+          output_path = str(entry.get("output_path", "") or "").strip()
+          skip_val = "1" if is_toggle_checked_value(entry.get("skip")) else "0"
 
-          size_x_str = size_x_item.text() if size_x_item else "1920"
-          size_y_str = size_y_item.text() if size_y_item else "1080"
-          resize_str = resize_item.text() if resize_item else "100"
-          output_path = self._get_cell_path(output_item)
           try:
-              send2bot = int(send2bot_item.text()) if send2bot_item and send2bot_item.text() else 0
+              send2bot = int(entry.get("send2bot", 0) or 0)
               if send2bot < 0:
                   send2bot = 0
-          except ValueError:
+          except (TypeError, ValueError):
               send2bot = 0
 
+          send_mp4 = is_toggle_checked_value(entry.get("send_mp4"))
+
           if not hip_file or not rop_name:
-              self.log(f"⚠️ Строка {row+1}: HIP файл или ROP не указаны. Пропускаю.")
+              self.log_t("row_no_hip_rop", row=row + 1)
+              continue
+
+          if not os.path.isfile(hip_file):
+              self.log_t("row_hip_missing", row=row + 1, hip_file=hip_file)
               continue
 
           if not output_path:
-              self.log(
-                  f"⚠️ Строка {row+1} ({rop_name}): "
-                  f"{TRANSLATIONS[self.current_language]['path_empty']}"
+              self.log_t(
+                  "row_path_empty",
+                  row=row + 1,
+                  rop_name=rop_name,
+                  detail=TRANSLATIONS[self.current_language]["path_empty"],
               )
 
           try:
-              start_frame = int(start_frame_str) if start_frame_str else 1
-              end_frame = int(end_frame_str) if end_frame_str else 100
-          except ValueError:
-              self.log(f"⚠️ Строка {row+1}: Неверный диапазон кадров. Используются значения по умолчанию (1-100).")
+              start_frame = int(entry.get("start_frame", 1) or 1)
+              end_frame = int(entry.get("end_frame", 100) or 100)
+          except (TypeError, ValueError):
+              self.log_t("row_bad_frames", row=row + 1)
               start_frame = 1
               end_frame = 100
 
-          base_x, base_y, resize_pct, actual_x, actual_y = self._resolve_render_size(row)
+          base_x, base_y, resize_pct, actual_x, actual_y = self.queue_model.resolve_render_size(row)
+
+          work_total = end_frame - start_frame + 1
+          if skip_val == "1" and output_path:
+              work_total = len(
+                  missing_render_frames(
+                      output_path, start_frame, end_frame, hip_file, rop_name
+                  )
+              )
 
           queue_data.append({
               "row": row,
@@ -2131,6 +2530,7 @@ class RenderManager(QWidget):
               "start_frame": start_frame,
               "end_frame": end_frame,
               "skip_val": skip_val,
+              "work_total": work_total,
               "size_x": base_x,
               "size_y": base_y,
               "resize_pct": resize_pct,
@@ -2138,69 +2538,73 @@ class RenderManager(QWidget):
               "render_height": actual_y,
               "output_path": output_path,
               "send2bot": send2bot,
+              "send_mp4": send_mp4,
           })
 
       if not queue_data:
-          self.log("⚠️ Нет включённых задач для рендера.")
-          self.stop_btn.setEnabled(False)
-          set_disabled_style(self.stop_btn)
-          self.update_start_button()
+          self.log_t("no_enabled_jobs")
           return
+
+      self.log_t("render_start", count=len(queue_data))
+      self._jobs_done = 0
+      self._active_render_ratio = 0.0
+      self._progress_ui_row = -1
+      self._render_job_total = len(queue_data)
+      self._start_eta_tracking(queue_data)
+      self.stop_btn.setEnabled(True)
+      set_delete_style(self.stop_btn)
+      self.start_btn.setEnabled(False)
+      set_disabled_style(self.start_btn)
 
       self._render_jobs = queue_data
-      self.queue_thread = RenderQueueWorker(queue_data)
-      self.queue_thread.log_signal.connect(self.log)
-      self.queue_thread.update_row_signal.connect(self.on_worker_update_row)
-      self.queue_thread.progress_signal.connect(self.on_render_progress)
-      self.queue_thread.frame_progress_signal.connect(self.on_render_frame_progress)
-      self.queue_thread.finished_signal.connect(self.on_queue_finished)
+      self.queue_thread = RenderQueueWorker(queue_data, language=self.current_language)
+      conn = Qt.ConnectionType.QueuedConnection
+      self.queue_thread.log_signal.connect(self.log, conn)
+      self.queue_thread.update_row_signal.connect(self.on_worker_update_row, conn)
+      self.queue_thread.progress_signal.connect(self.on_render_progress, conn)
+      self.queue_thread.frame_progress_signal.connect(self.on_render_frame_progress, conn)
+      self.queue_thread.finished_signal.connect(self.on_queue_finished, conn)
       self.queue_thread.start()
-
-  def _format_running_status(self, ratio=None):
-      parts = []
-      if ratio is not None:
-          try:
-              parts.append(f"{int(float(ratio) * 100)}%")
-          except (TypeError, ValueError):
-              pass
-      if self._render_job_total > 0:
-          parts.append(f"{self._render_job_cur}/{self._render_job_total}")
-      if not parts:
-          return "Running"
-      return "Running " + " · ".join(parts)
+      self.log_t("thread_started", count=len(queue_data))
 
   def _set_status_render_progress(self, row, ratio=None):
-      status_item = self.queue_table.item(row, COL_STATUS)
-      if not status_item:
-          return
       if ratio is None:
-          status_item.setData(RENDER_PROGRESS_ROLE, None)
+          self.queue_model.set_status(
+              row, self.queue_model.get_text(row, COL_STATUS), progress=None
+          )
       else:
-          status_item.setData(RENDER_PROGRESS_ROLE, float(ratio))
-          status_item.setText(self._format_running_status(ratio))
-          apply_status_style(status_item, "Running")
-      self.queue_table.update(self.queue_table.model().index(row, COL_STATUS))
+          self.queue_model.set_status(row, "Running", progress=float(ratio))
 
   def _clear_all_status_render_progress(self):
       for row in range(self.queue_table.rowCount()):
-          item = self.queue_table.item(row, COL_STATUS)
-          if item and item.data(RENDER_PROGRESS_ROLE) is not None:
-              item.setData(RENDER_PROGRESS_ROLE, None)
-              self.queue_table.update(self.queue_table.model().index(row, COL_STATUS))
+          if self.queue_model.data(
+              self.queue_model.index(row, COL_STATUS), RENDER_PROGRESS_ROLE
+          ) is not None:
+              self.queue_model.set_status(
+                  row, self.queue_model.get_text(row, COL_STATUS), progress=None
+              )
 
-  def on_render_frame_progress(self, row, ratio):
-      self._set_status_render_progress(row, ratio)
+  def on_render_frame_progress(self, row, ratio, work_done, work_total, frame_seconds):
+      self._apply_row_progress(row, ratio)
+      if work_done > 0:
+          self._on_frame_rendered(row, work_done, work_total, frame_seconds)
 
   def on_render_progress(self, cur, total, row):
       self._render_job_cur = cur
       self._render_job_total = total
-      self._clear_all_status_render_progress()
-      self._set_status_render_progress(row, 0.0)
-      self._update_render_progress(cur, total, row, "Running")
+      if self._progress_ui_row != row:
+          self._active_render_ratio = 0.0
+          for r in range(self.queue_table.rowCount()):
+              if r != row:
+                  self._set_status_render_progress(r, None)
+          self._set_status_render_progress(row, 0.0)
+      self._progress_ui_row = row
+      self._update_global_progress(cur, total, row, "Running")
+      self._update_eta_displays()
       self.queue_table.selectRow(row)
-      item = self.queue_table.item(row, 0)
-      if item:
-          self.queue_table.scrollToItem(item)
+      scroll_item = self.queue_table.item(row, 0)
+      if scroll_item:
+          self.queue_table.scrollToItem(scroll_item)
 
   def stop_render(self):
       t = TRANSLATIONS[self.current_language]
@@ -2214,23 +2618,25 @@ class RenderManager(QWidget):
           )
           if reply != QMessageBox.StandardButton.Yes:
               return
-      self.log("⏹️ Попытка остановить рендер...")
+      self.log_t("stop_attempt")
       if self.queue_thread and self.queue_thread.isRunning():
           self.queue_thread.requestInterruption()
       if stop_render():
-          self.log("✅ Процесс рендера остановлен.")
+          self.log_t("render_stopped")
           for row in range(self.queue_table.rowCount()):
-              status_item = self.queue_table.item(row, COL_STATUS)
-              if status_item and status_item.text() == "Running":
-                  status_item.setText("Stopped")
-                  apply_status_style(status_item, "Stopped")
+              if self.queue_model.get_text(row, COL_STATUS) == "Running":
+                  self.queue_model.set_status(row, "Stopped", progress=None)
           self._clear_all_status_render_progress()
           self._render_job_cur = 0
           self._render_job_total = 0
-          self._update_render_progress(0, 0, 0, "")
+          self._jobs_done = 0
+          self._active_render_ratio = 0.0
+          self._progress_ui_row = -1
+          self._stop_eta_tracking()
+          self._update_global_progress(0, 0, -1, "")
           self.save_state()
       else:
-          self.log("⚠️ Процесс рендера не запущен или не удалось его остановить.")
+          self.log_t("render_not_running")
 
       self.stop_btn.setEnabled(False)
       set_disabled_style(self.stop_btn)
@@ -2238,60 +2644,64 @@ class RenderManager(QWidget):
 
   def on_worker_update_row(self, row, status, start_time, end_time):
       if status == "Running":
+          self._row_render_start[row] = time.monotonic()
+          self._row_work_done[row] = 0
+          self._row_last_frame_mono.pop(row, None)
+          self._row_frame_seconds.pop(row, None)
           self._set_status_render_progress(row, 0.0)
-      else:
-          self._set_status_render_progress(row, None)
-          status_item = self.queue_table.item(row, COL_STATUS)
-          if status_item:
-              status_item.setText(status)
-              apply_status_style(status_item, status)
-      start_time_item = self.queue_table.item(row, 13)
-      end_time_item = self.queue_table.item(row, 14)
-      duration_item = self.queue_table.item(row, 15)
-      if start_time and start_time_item:
-          start_time_item.setText(start_time)
-      if end_time and end_time_item:
-          end_time_item.setText(end_time)
-      if duration_item and start_time_item and end_time_item:
-          duration_item.setText(
-              format_duration_hms(start_time_item.text(), end_time_item.text())
-          )
+          self.queue_model.set_times(row, start_time=start_time, end_time="")
+          self._update_eta_displays()
+          return
+      start_mono = self._row_render_start.pop(row, None)
+      if start_mono and status == "Completed":
+          dur = time.monotonic() - start_mono
+          if dur >= 1.0:
+              self._job_duration_samples.append(dur)
+      self._row_work_ratio.pop(row, None)
+      self._set_status_render_progress(row, None)
+      self.queue_model.set_status(row, status, progress=None)
+      if status in ("Completed", "Skipped", "Failed", "Stopped"):
+          self._jobs_done += 1
+          self._active_render_ratio = 0.0
+          if self.queue_thread and self.queue_thread.isRunning():
+              cur = min(self._jobs_done, self._render_job_total)
+              self._update_global_progress(cur, self._render_job_total, row, status)
+      st = start_time or self.queue_model.get_text(row, COL_START_TIME)
+      et = end_time
+      duration = format_duration_hms(st, et) if st and et else "--"
+      self.queue_model.set_times(
+          row,
+          start_time=start_time if start_time else None,
+          end_time=end_time if end_time else None,
+          duration=duration,
+      )
+      self._update_eta_displays()
 
   def on_queue_finished(self, cancelled):
       if cancelled:
-          self.log("\n⏹️ Очередь рендера остановлена пользователем.")
+          self.log_t("queue_cancelled")
       else:
-          self.log("\n✅ Очередь рендера завершена.")
+          self.log_t("queue_done")
       self.queue_thread = None
       self._render_jobs = []
       self._clear_all_status_render_progress()
       self._render_job_cur = 0
       self._render_job_total = 0
-      self._update_render_progress(0, 0, 0, "")
+      self._jobs_done = 0
+      self._active_render_ratio = 0.0
+      self._progress_ui_row = -1
+      self._stop_eta_tracking()
+      self._update_global_progress(0, 0, -1, "")
       self.stop_btn.setEnabled(False)
       set_disabled_style(self.stop_btn)
       self.update_start_button()
       self.save_state()
 
   def _collect_queue_entries(self):
-      return [
-          self._queue_row_to_entry(row)
-          for row in range(self.queue_table.rowCount())
-      ]
+      return self.queue_model.all_entries()
 
   def _restore_queue_entries(self, entries):
-      self.queue_table.blockSignals(True)
-      was_initialized = self.initialized
-      self.initialized = False
-      try:
-          self.queue_table.setRowCount(0)
-          for entry in entries:
-              row = self.queue_table.rowCount()
-              self.queue_table.insertRow(row)
-              self._populate_queue_row(row, entry=entry)
-      finally:
-          self.initialized = was_initialized
-          self.queue_table.blockSignals(False)
+      self.queue_model.load_entries(entries)
       self.update_start_button()
       self.on_queue_selection_changed()
 
@@ -2299,21 +2709,10 @@ class RenderManager(QWidget):
       if self.queue_thread and self.queue_thread.isRunning():
           self.log(TRANSLATIONS[self.current_language]["queue_reorder_blocked"])
           return
-      count = self.queue_table.rowCount()
-      if src_row < 0 or src_row >= count:
-          return
-      dest_row = max(0, min(int(dest_row), count))
-      if src_row == dest_row or src_row + 1 == dest_row:
-          return
-      entries = self._collect_queue_entries()
-      entry = entries.pop(src_row)
-      if dest_row > src_row:
-          dest_row -= 1
-      entries.insert(dest_row, entry)
-      self._restore_queue_entries(entries)
-      self.queue_table.selectRow(dest_row)
-      if self.initialized:
-          self.save_state()
+      if self.queue_model.move_row(src_row, dest_row):
+          self.queue_table.selectRow(min(src_row, dest_row))
+          if self.initialized:
+              self.save_state()
 
   def move_queue_row_up(self, row=None):
       if row is None:
@@ -2330,41 +2729,13 @@ class RenderManager(QWidget):
       self._move_queue_row(row, row + 2)
 
   def _queue_row_to_entry(self, row):
-      """Serialize one queue row for save/duplicate."""
-      entry = {}
-      for col, key in enumerate(QUEUE_COLUMN_KEYS):
-          cell = self.queue_table.item(row, col)
-          if col in (0, 6):
-              default = "1" if col == 0 else "0"
-              raw = cell.data(Qt.UserRole) if cell else None
-              entry[key] = normalize_toggle_value(raw, default)
-          elif key in ("hip", "output_path"):
-              entry[key] = self._get_cell_path(cell)
-          elif col in (7, 8, 9):
-              continue
-          else:
-              entry[key] = cell.text() if cell else ""
-      base_x, base_y = self._read_base_resolution(row)
-      if base_x is None or base_y is None:
-          base_x, base_y, _, actual_x, actual_y = self._resolve_render_size(row)
-      else:
-          rz_item = self.queue_table.item(row, 9)
-          resize_pct = self._parse_resize_pct(rz_item.text() if rz_item else "100")
-          actual_x = max(1, int(base_x * resize_pct / 100))
-          actual_y = max(1, int(base_y * resize_pct / 100))
-      entry["size_x_base"] = str(base_x)
-      entry["size_y_base"] = str(base_y)
-      entry["size_x"] = str(actual_x)
-      entry["size_y"] = str(actual_y)
-      rz_item = self.queue_table.item(row, 9)
-      entry["resize"] = rz_item.text() if rz_item else "100%"
-      return entry
+      return self.queue_model.row_to_entry(row)
 
   def duplicate_queue_row(self, row=None):
       if row is None:
           selected = self.queue_table.selectedIndexes()
           if not selected:
-              self.log("⚠️ Выберите элемент в очереди.")
+              self.log_t("select_queue_row")
               return
           row = selected[0].row()
       entry = self._queue_row_to_entry(row)
@@ -2373,7 +2744,6 @@ class RenderManager(QWidget):
       entry["end_time"] = ""
       entry["duration"] = "--"
       new_row = row + 1
-      self.queue_table.insertRow(new_row)
       self._populate_queue_row(new_row, entry=entry)
       self.queue_table.selectRow(new_row)
       self.update_start_button()
@@ -2381,89 +2751,73 @@ class RenderManager(QWidget):
       if self.initialized:
           self.save_state()
       rop_name = entry.get("rop", "?")
-      self.log(f"✓ Дубликат добавлен (строка {new_row + 1}): {rop_name}")
+      self.log_t("duplicate_added", row=new_row + 1, rop_name=rop_name)
 
   def reset_rop(self):
       selected_rows = self.queue_table.selectedIndexes()
       if not selected_rows:
-          self.log("⚠️ Выберите элемент в очереди.")
+          self.log_t("select_queue_row")
           return
       row = selected_rows[0].row()
       
-      # Get ROP name from column 2
-      rop_name_item = self.queue_table.item(row, 2)
-      if not rop_name_item:
+      rop_name = self.queue_model.get_text(row, COL_ROP)
+      if not rop_name:
           return
       
-      rop_name = rop_name_item.text()
-      
-      # Get HIP file from column 1
-      hip_item = self.queue_table.item(row, COL_HIP)
-      hip_file = self._get_cell_path(hip_item)
+      hip_file = self.queue_model.get_path(row, COL_HIP)
       
       if not hip_file:
-          self.log("⚠️ HIP файл не указан для этого ROP.")
+          self.log_t("hip_not_for_rop")
           return
 
-      self.log(f"🔄 Считывание параметров {rop_name} из {os.path.basename(hip_file)}...")
+      self.log_t("rop_reset_read", rop_name=rop_name, hip=os.path.basename(hip_file))
       
       # Run scan to get latest data
       rops_data, error = self._run_scan(hip_file)
       if error:
-          self.log(f"❌ Ошибка при считывании: {error}")
+          self.log_t("read_error", error=error)
           return
       
       rop_data = next((r for r in rops_data if r["name"] == rop_name), None)
       
       if rop_data:
-          # Reset start and end frames from file (columns 4-5)
           start_frame = str(rop_data.get("start_frame", "1"))
           end_frame = str(rop_data.get("end_frame", "100"))
-          
-          self.queue_table.setItem(row, 4, QTableWidgetItem(start_frame))
-          self.queue_table.setItem(row, 5, QTableWidgetItem(end_frame))
-          
-          skip_checked = bool(rop_data.get("skip_existing"))
-          self.queue_table.setItem(row, 6, create_toggle_item(skip_checked))
-          
-          # Reset Size X and Y (columns 7-8)
+          self.queue_model.set_field(row, "start_frame", start_frame)
+          self.queue_model.set_field(row, "end_frame", end_frame)
+          self.queue_model.set_field(
+              row, "skip", "1" if rop_data.get("skip_existing") else "0"
+          )
           size_x = str(rop_data.get("size_x", "1920"))
           size_y = str(rop_data.get("size_y", "1080"))
-          self.queue_table.setItem(row, 7, QTableWidgetItem(size_x))
-          self.queue_table.setItem(row, 8, QTableWidgetItem(size_y))
-          self.queue_table.setItem(row, 9, QTableWidgetItem("100"))
-          self._set_base_resolution(row, size_x, size_y)
-          self._apply_resize_display(row)
-          
-          # Reset Output path (column 10)
+          self.queue_model.set_resize(row, "100%", base_x=size_x, base_y=size_y)
           output_path = rop_data.get("output_path", "")
-          hip_for_row = self._get_cell_path(self.queue_table.item(row, COL_HIP))
-          self.queue_table.setItem(
-              row, COL_OUTPUT,
-              self._make_path_item(
-                  output_path, editable=True, hip_file=hip_for_row, op_name=rop_name
-              ),
+          self.queue_model.set_path(
+              row, COL_OUTPUT, output_path, hip_file=hip_file, op_name=rop_name
           )
-          
-          status_item = self._make_readonly_item("Queued")
-          apply_status_style(status_item, "Queued")
-          self.queue_table.setItem(row, COL_STATUS, status_item)
+          self.queue_model.reset_status_row(row)
           
           self.save_state()
-          self.log(f"✓ ROP сброшен на значения из файла: {start_frame}-{end_frame}, размер: {size_x}x{size_y}")
+          self.log_t(
+              "rop_reset_ok",
+              start_frame=start_frame,
+              end_frame=end_frame,
+              size_x=size_x,
+              size_y=size_y,
+          )
       else:
-          self.log(f"⚠️ ROP {rop_name} не найден в файле {os.path.basename(hip_file)}.")
+          self.log_t("rop_not_in_file", rop_name=rop_name, hip=os.path.basename(hip_file))
 
   def remove_rop_from_queue(self):
       selected_rows = self.queue_table.selectedIndexes()
       if not selected_rows:
-          self.log("⚠️ Выберите элемент в очереди.")
+          self.log_t("select_queue_row")
           return
       row = selected_rows[0].row()
       self.queue_table.removeRow(row)
       self.update_start_button()
       self.save_state()
-      self.log("✓ ROP удален из очереди.")
+      self.log_t("rop_removed")
 
   def on_queue_cell_changed(self, row, col):
       """Handle changes to queue table cells"""
@@ -2473,74 +2827,50 @@ class RenderManager(QWidget):
       if col in (COL_HIP, COL_OUTPUT):
           return
 
-      # Block signals to prevent infinite recursion when programmatically updating cells
-      self.queue_table.blockSignals(True)
-      try:
-          # Handle Resize column (col 9) - recalculate Size X/Y
-          if col == 9:
-              try:
-                  base_x, base_y, resize_pct, actual_x, actual_y = self._apply_resize_display(row)
-                  self.log(
-                      f"Масштабирование {row + 1}: {base_x}x{base_y} -> {actual_x}x{actual_y} ({resize_pct:g}%)"
-                  )
-              except Exception as e:
-                  self.log(f"Ошибка обработки Resize: {e}")
+      if col == 9:
+          try:
+              base_x, base_y, resize_pct, actual_x, actual_y = self._apply_resize_display(row)
+              self.log_t(
+                  "resize_changed",
+                  row=row + 1,
+                  base_x=base_x,
+                  base_y=base_y,
+                  actual_x=actual_x,
+                  actual_y=actual_y,
+                  resize_pct=resize_pct,
+              )
+          except Exception as e:
+              self.log_t("resize_error", e=e)
 
-          if col in (7, 8):
-              item = self.queue_table.item(row, col)
-              if item:
-                  try:
-                      val = int(float(item.text() or 0))
-                      if val > 0:
-                          role_x, role_y = self._read_base_resolution(row)
-                          base_x = val if col == 7 else (role_x or val)
-                          base_y = val if col == 8 else (role_y or val)
-                          rz = self.queue_table.item(row, 9)
-                          if rz:
-                              rz.setText("100%")
-                          self._apply_resize_display(row, base_x=base_x, base_y=base_y)
-                          self.log(
-                              f"Строка {row + 1}: новый базовый размер {base_x}x{base_y}, Resize сброшен на 100%"
-                          )
-                  except ValueError:
-                      pass
-          
-          # Handle Send2Bot every column (col 12) - normalize integer
-          if col == 12:
-              item = self.queue_table.item(row, col)
-              if item:
-                  try:
-                      value = int(item.text()) if item.text() else 0
-                  except ValueError:
-                      value = 0
-                  if value < 0:
-                      value = 0
-                  item.setText(str(value))
-      finally:
-          # Re-enable signals after all updates
-          self.queue_table.blockSignals(False)
-      
-      # Save state when cells change (except for toggle columns 0 and 6)
-      if col not in [0, 6]:
+      if col in (7, 8):
+          try:
+              base_x, base_y, _, actual_x, actual_y = self.queue_model.resolve_render_size(row)
+              self.log_t(
+                  "size_changed",
+                  row=row + 1,
+                  base_x=base_x,
+                  base_y=base_y,
+                  actual_x=actual_x,
+                  actual_y=actual_y,
+              )
+          except Exception as e:
+              self.log_t("size_error", e=e)
+
+      if col not in (0, 6, COL_SEND_MP4):
           self.save_state()
+
+  def _on_queue_double_clicked(self, index):
+      if not index.isValid():
+          return
+      self.on_queue_cell_double_clicked(index.row(), index.column())
 
   def on_queue_cell_double_clicked(self, row, col):
       if col not in (COL_OUTPUT, COL_HIP):
           return
-      item = self.queue_table.item(row, col)
-      if not item:
-          return
-      full = self._get_cell_path(item) or item.text().strip()
+      full = self.queue_model.get_path(row, col)
       if not full:
           return
-      self._queue_cell_edit_guard = True
-      self.queue_table.blockSignals(True)
-      try:
-          item.setText(full)
-      finally:
-          self.queue_table.blockSignals(False)
-          self._queue_cell_edit_guard = False
-      self.queue_table.editItem(item)
+      self.queue_table.edit(self.queue_model.index(row, col))
 
   def on_queue_selection_changed(self):
       """Handle selection changes in queue table"""
@@ -2562,6 +2892,9 @@ class RenderManager(QWidget):
 
   def log(self, msg):
       self.log_output.append(msg)
+
+  def log_t(self, key, **kwargs):
+      self.log(log_msg(self.current_language, key, **kwargs))
 
   def _run_scan(self, hip_file):
       """Internal method to run scan and return ROP data list"""
@@ -2614,7 +2947,7 @@ class RenderManager(QWidget):
   def scan_hip_file(self):
       hip_file = self.get_active_hip_path()
       if not hip_file:
-          self.log("⚠️ No HIP file selected.")
+          self.log_t("no_hip_selected")
           return
 
       self.last_scanned_hip = hip_file
@@ -2628,7 +2961,7 @@ class RenderManager(QWidget):
           
           self.all_rops = rops_data
           
-          self.log(f"✅ Found {len(self.all_rops)} ROPs in {os.path.basename(hip_file)}")
+          self.log_t("scan_found", count=len(self.all_rops), hip=os.path.basename(hip_file))
           self.update_rop_list()
           self.update_rop_count_label()
           self.add_queue_btn.setEnabled(True)
@@ -2636,7 +2969,7 @@ class RenderManager(QWidget):
           self.add_all_rops_btn.setEnabled(True)
           set_next_style(self.add_all_rops_btn)
       except Exception as e:
-          self.log(f"❌ Error scanning HIP file: {e}")
+          self.log_t("scan_fail", e=e)
 
   def update_rop_list(self):
       self.rop_list.clear()

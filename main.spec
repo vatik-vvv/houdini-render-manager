@@ -9,6 +9,7 @@ extra_datas = [
     ("HouRM_icon.ico", "."),
     ("logo_met2.png", "."),
     ("render_rop.py", "."),
+    ("path_utils.py", "."),
     ("scan_rops.py", "."),
     ("config.example.json", "."),
 ]
@@ -20,6 +21,12 @@ hiddenimports = [
     "cv2",
     "frame_preview",
     "app_paths",
+    "queue_model",
+    "ui_theme",
+    "video_preview",
+    "path_utils",
+    "telegram_notifier",
+    "i18n",
 ]
 
 for pkg in ("PIL", "numpy", "cv2"):

@@ -2,11 +2,8 @@
 import re
 
 HRM_FRAME_RE = re.compile(r"HRM_FRAME\s+(\d+)", re.I)
-FRAME_HINT_RES = (
-    re.compile(r"(?:^|\s)frame\s*[:=]?\s*(\d+)", re.I),
-    re.compile(r"rendering\s+frame\s+(\d+)", re.I),
-    re.compile(r"render\s+.*?frame\s+(\d+)", re.I),
-)
+HRM_WORK_RE = re.compile(r"HRM_WORK\s+(\d+)\s+(\d+)", re.I)
+REDSHIFT_ROP_TOTAL_RE = re.compile(r"total time\s+([\d.]+)\s*sec", re.I)
 
 
 def ratio_for_frame(frame, start_frame, end_frame):
@@ -25,21 +22,44 @@ def ratio_for_frame(frame, start_frame, end_frame):
     return min(1.0, max(0.0, (frame - start_frame) / float(span)))
 
 
-def parse_frame_from_line(line, start_frame, end_frame):
+def parse_redshift_rop_total_seconds(line):
+    """ROP total time per frame (extraction + render), not beauty-pass only."""
+    if not line or "rop node" not in line.lower():
+        return None
+    m = REDSHIFT_ROP_TOTAL_RE.search(line)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
+def ratio_for_work(done, total):
+    try:
+        done = int(done)
+        total = int(total)
+    except (TypeError, ValueError):
+        return None
+    if total <= 0:
+        return 1.0 if done > 0 else 0.0
+    return min(1.0, max(0.0, done / float(total)))
+
+
+def work_progress_from_line(line, start_frame, end_frame):
+    """After our script marks a frame done: (ratio, work_done, work_total) or None."""
     if not line:
         return None
+    m = HRM_WORK_RE.search(line)
+    if m:
+        done, total = int(m.group(1)), int(m.group(2))
+        return ratio_for_work(done, total), done, total
     m = HRM_FRAME_RE.search(line)
     if m:
-        return int(m.group(1))
-    for pattern in FRAME_HINT_RES:
-        m = pattern.search(line)
-        if m:
-            return int(m.group(1))
+        frame = int(m.group(1))
+        if frame < int(start_frame) or frame > int(end_frame):
+            return None
+        total = int(end_frame) - int(start_frame) + 1
+        done = frame - int(start_frame) + 1
+        return ratio_for_frame(frame, start_frame, end_frame), done, total
     return None
-
-
-def progress_from_line(line, start_frame, end_frame):
-    frame = parse_frame_from_line(line, start_frame, end_frame)
-    if frame is None or frame < start_frame or frame > end_frame:
-        return None
-    return ratio_for_frame(frame, start_frame, end_frame)

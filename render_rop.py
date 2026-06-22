@@ -4,10 +4,22 @@ Must run inside Houdini (hython), not standalone Python.
 """
 import argparse
 import logging
+import os
 import sys
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(message)s")
 logger = logging.getLogger(__name__)
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+from path_utils import (
+    expand_frame_in_path,
+    frame_file_exists,
+    has_frame_tokens,
+    output_template_for_frames,
+)
 
 SKIP_PARM_EXACT = (
     "RS_skipExistingFrames",
@@ -464,11 +476,33 @@ def apply_resolution(node, width, height, resize_pct=100.0):
             logger.warning("  Render camera not found — cannot apply camera resolution fallback")
 
 
-def render_frame_range(node, start, end):
+def _frames_to_render(start, end, skip_on, output, hip, rop_name):
+    """Frames that still need rendering (skip-existing aware)."""
+    all_frames = list(range(start, end + 1))
+    if not skip_on or not output:
+        return all_frames
+    template = output_template_for_frames(output)
+    if not has_frame_tokens(template):
+        return all_frames
+    needed = []
+    for frame in all_frames:
+        path = expand_frame_in_path(template, frame, hip, rop_name)
+        if not frame_file_exists(path):
+            needed.append(frame)
+    return needed
+
+
+def render_frame_range(node, start, end, skip_on=False, output="", hip="", rop_name=""):
     import hou
 
+    frames_to_render = _frames_to_render(start, end, skip_on, output, hip, rop_name)
+    work_total = len(frames_to_render)
+    needed = set(frames_to_render)
+    work_done = 0
+
     for frame in range(start, end + 1):
-        print(f"HRM_FRAME {frame}", flush=True)
+        if skip_on and frame not in needed:
+            continue
         try:
             node.render(frame_range=(frame, frame))
         except TypeError:
@@ -476,6 +510,11 @@ def render_frame_range(node, start, end):
         except hou.OperationFailed as e:
             logger.error(str(e))
             sys.exit(1)
+        work_done += 1
+        if skip_on and work_total > 0:
+            print(f"HRM_WORK {work_done} {work_total}", flush=True)
+        else:
+            print(f"HRM_FRAME {frame}", flush=True)
 
 
 def main():
@@ -511,8 +550,18 @@ def main():
     apply_output_path(node, args.output)
 
     logger.info(f"Rendering frames {args.start}-{args.end} on {node.path()}")
-    render_frame_range(node, args.start, args.end)
-    print(f"HRM_FRAME {args.end}", flush=True)
+    if skip_on and args.output:
+        todo = _frames_to_render(args.start, args.end, skip_on, args.output, hip, args.rop)
+        logger.info(f"Frames to render (skip existing): {len(todo)} / {args.end - args.start + 1}")
+    render_frame_range(
+        node,
+        args.start,
+        args.end,
+        skip_on=skip_on,
+        output=args.output,
+        hip=hip,
+        rop_name=args.rop,
+    )
     logger.info("Render finished.")
 
 

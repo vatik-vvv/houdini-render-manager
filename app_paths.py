@@ -30,15 +30,30 @@ def bundled_script(filename):
     return fallback if os.path.isfile(fallback) else path
 
 
+HYTHON_SCRIPT_DEPS = {
+    "render_rop.py": ("path_utils.py",),
+}
+
+
+def _sync_script_to_app_dir(src, dest):
+    if not os.path.isfile(src):
+        return
+    if not os.path.isfile(dest) or os.path.getmtime(src) > os.path.getmtime(dest):
+        shutil.copy2(src, dest)
+
+
 def hython_script_path(filename):
     """Stable .py path for hython — beside .exe when frozen (PyInstaller _MEIPASS is internal)."""
     src = bundled_script(filename)
-    if not os.path.isfile(src) or not is_frozen():
+    if not is_frozen():
         return src
     dest = os.path.join(app_dir(), filename)
     try:
-        if not os.path.isfile(dest) or os.path.getmtime(src) > os.path.getmtime(dest):
-            shutil.copy2(src, dest)
+        _sync_script_to_app_dir(src, dest)
+        for dep in HYTHON_SCRIPT_DEPS.get(filename, ()):
+            dep_src = bundled_script(dep)
+            dep_dest = os.path.join(app_dir(), dep)
+            _sync_script_to_app_dir(dep_src, dep_dest)
     except OSError:
         return src
     return dest if os.path.isfile(dest) else src

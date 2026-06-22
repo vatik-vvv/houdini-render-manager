@@ -36,6 +36,9 @@ PREVIEW_MAX_SIDE_LIMIT = 8000
 BOT_TOKEN = ""
 CHAT_ID = ""
 PREVIEW_MAX_SIDE = DEFAULT_PREVIEW_MAX_SIDE
+SEND_MP4_ON_COMPLETE = False
+MP4_MAX_SIDE = 0
+MP4_USE_PREVIEW_MAX = True
 
 SUPPORTED_PREVIEW_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".exr", ".bmp", ".webp",
@@ -43,7 +46,7 @@ SUPPORTED_PREVIEW_EXTENSIONS = {
 
 
 def _load_config():
-    global BOT_TOKEN, CHAT_ID, PREVIEW_MAX_SIDE
+    global BOT_TOKEN, CHAT_ID, PREVIEW_MAX_SIDE, SEND_MP4_ON_COMPLETE, MP4_MAX_SIDE, MP4_USE_PREVIEW_MAX
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, encoding="utf-8") as f:
@@ -57,6 +60,12 @@ def _load_config():
             except (TypeError, ValueError):
                 PREVIEW_MAX_SIDE = DEFAULT_PREVIEW_MAX_SIDE
             PREVIEW_MAX_SIDE = max(PREVIEW_MIN_SIDE, min(PREVIEW_MAX_SIDE, PREVIEW_MAX_SIDE_LIMIT))
+            SEND_MP4_ON_COMPLETE = bool(tg.get("send_mp4_on_complete", True))
+            MP4_USE_PREVIEW_MAX = bool(tg.get("mp4_use_preview_max_side", True))
+            try:
+                MP4_MAX_SIDE = int(tg.get("mp4_max_side", 0))
+            except (TypeError, ValueError):
+                MP4_MAX_SIDE = 0
         except Exception as e:
             logger.warning(f"Error loading Telegram config: {e}")
     else:
@@ -109,14 +118,23 @@ def _resolve_max_side(max_side):
     return max(PREVIEW_MIN_SIDE, min(value, PREVIEW_MAX_SIDE_LIMIT))
 
 
-def send_message(text, timeout=5):
+def get_mp4_max_side():
+    reload_config()
+    if MP4_USE_PREVIEW_MAX or MP4_MAX_SIDE <= 0:
+        return PREVIEW_MAX_SIDE
+    return max(PREVIEW_MIN_SIDE, min(MP4_MAX_SIDE, PREVIEW_MAX_SIDE_LIMIT))
+
+
+def send_message(text, timeout=5, bot_token=None, chat_id=None):
     """Send message to Telegram with timeout. Returns (ok, detail)."""
     reload_config()
-    if not BOT_TOKEN or not CHAT_ID:
+    token = (bot_token or BOT_TOKEN or "").strip()
+    chat = str(chat_id if chat_id is not None else CHAT_ID).strip()
+    if not token or not chat:
         return False, "Telegram bot_token или chat_id не заданы в config.json"
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text}
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat, "text": text}
 
     try:
         response = requests.post(url, json=payload, timeout=timeout)
@@ -125,6 +143,20 @@ def send_message(text, timeout=5):
         return False, f"Telegram API {response.status_code}: {response.text[:200]}"
     except requests.Timeout:
         return False, f"Таймаут Telegram (>{timeout}s)"
+    except Exception as e:
+        return False, str(e)
+
+
+def test_bot_connection(bot_token=None, chat_id=None, timeout=5):
+    token = (bot_token or BOT_TOKEN or "").strip()
+    if not token:
+        return False, "bot_token пуст"
+    url = f"https://api.telegram.org/bot{token}/getMe"
+    try:
+        response = requests.get(url, timeout=timeout)
+        if response.status_code == 200:
+            return True, ""
+        return False, f"Telegram API {response.status_code}: {response.text[:200]}"
     except Exception as e:
         return False, str(e)
 
@@ -256,6 +288,38 @@ def _send_photo_file(file_path, caption=None, mime="image/jpeg", timeout=30):
     if response.status_code == 200:
         return True, ""
     return False, f"Telegram API {response.status_code}: {response.text[:300]}"
+
+
+def _send_video_file(file_path, caption=None, timeout=120):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo"
+    with open(file_path, "rb") as video_file:
+        files = {"video": (os.path.basename(file_path), video_file, "video/mp4")}
+        data = {"chat_id": CHAT_ID}
+        if caption:
+            data["caption"] = caption[:1024]
+        response = requests.post(url, data=data, files=files, timeout=timeout)
+    if response.status_code == 200:
+        return True, ""
+    return False, f"Telegram API {response.status_code}: {response.text[:300]}"
+
+
+def send_video(video_path, caption=None, timeout=120):
+    reload_config()
+    if not SEND_MP4_ON_COMPLETE:
+        return False, "MP4 превью отключено в настройках"
+    if not BOT_TOKEN or not CHAT_ID:
+        return False, "Telegram bot_token или chat_id не заданы в config.json"
+    if not video_path or not os.path.isfile(video_path):
+        return False, f"Файл не найден: {video_path}"
+    size_mb = os.path.getsize(video_path) / (1024 * 1024)
+    if size_mb > 49:
+        return False, f"MP4 {size_mb:.1f} MB — лимит Telegram ~50 MB"
+    try:
+        return _send_video_file(video_path, caption=caption, timeout=timeout)
+    except requests.Timeout:
+        return False, f"Таймаут Telegram (>{timeout}s)"
+    except Exception as e:
+        return False, str(e)
 
 
 def send_image(image_path, caption=None, max_side=None, timeout=30):
