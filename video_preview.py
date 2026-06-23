@@ -2,11 +2,7 @@
 from __future__ import annotations
 
 import os
-import re
 import tempfile
-
-from frame_preview import frame_output_path, is_preview_frame
-from path_utils import expand_frame_in_path, resolve_houdini_vars
 
 try:
     import cv2

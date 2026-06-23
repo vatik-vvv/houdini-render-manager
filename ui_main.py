@@ -1,4 +1,4 @@
-import os, json, re, subprocess, requests, sys, time
+import os, json, re, subprocess, sys, time
 from datetime import datetime, timedelta
 from render_runner import run_render, stop_render
 from telegram_notifier import send_image, send_video, get_mp4_max_side, test_bot_connection, send_message, reload_config
@@ -6,45 +6,37 @@ from app_paths import config_path, app_icon_path, find_bundled_file, hython_scri
 from queue_model import (
     RenderQueueModel,
     RenderQueueView,
-    QUEUE_COLUMN_KEYS,
     COL_HIP,
     COL_ROP,
     COL_OUTPUT,
     COL_STATUS,
     COL_START_TIME,
-    COL_END_TIME,
-    COL_DURATION,
     COL_ETA,
     COL_SEND2BOT,
     COL_SEND_MP4,
     FULL_PATH_ROLE,
     RENDER_PROGRESS_ROLE,
-    BASE_SIZE_X_ROLE,
-    BASE_SIZE_Y_ROLE,
-    normalize_toggle_value,
     is_toggle_checked_value,
     _empty_row,
 )
-from ui_theme import apply_dark_theme, TOGGLE_ON_COLOR, TOGGLE_OFF_COLOR
+from ui_theme import apply_dark_theme, TOGGLE_ON_COLOR, TOGGLE_OFF_COLOR, ThemedCheckBox, paint_checkbox_indicator, CHECKBOX_INDICATOR_SIZE
 from path_utils import (
     norm_path_key,
     resolve_houdini_vars,
-    expand_frame_in_path,
     normalize_output_template,
-    path_tooltip,
     missing_render_frames,
 )
 from i18n import log_msg
 from PySide6.QtWidgets import (
       QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QListWidget, QComboBox,
-      QFileDialog, QLabel, QDialog, QLineEdit, QTableWidget, QTableWidgetItem,
-      QTextEdit, QCheckBox, QGroupBox, QApplication, QAbstractItemView, QSplitter,
+      QFileDialog, QLabel, QDialog, QLineEdit,
+      QTextEdit, QGroupBox, QApplication, QAbstractItemView, QSplitter,
       QSplitterHandle, QHeaderView, QScrollArea,
-      QSizePolicy, QStyledItemDelegate, QStyle, QStyleOptionButton, QStyleOptionViewItem,
-      QMessageBox, QMenu, QLineEdit, QSpinBox, QProgressBar
+      QSizePolicy, QStyledItemDelegate, QStyle, QStyleOptionViewItem,
+      QMessageBox, QMenu, QSpinBox, QProgressBar
   )
-from PySide6.QtGui import QPalette, QColor, QIcon, QFont, QPainter, QPen, QPixmap
-from PySide6.QtCore import Qt, QByteArray, QMimeData, QThread, Signal, QEvent, QRect, QSize, QTimer
+from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtCore import Qt, QByteArray, QThread, Signal, QEvent, QRect, QSize, QTimer
 
 CONFIG_FILE = config_path()
 HEADER_LOGO_HEIGHT_PX = 27
@@ -435,27 +427,6 @@ def finish_clock_from_now(seconds):
     return (datetime.now() + timedelta(seconds=seconds)).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def is_toggle_checked(item):
-    if item is None:
-        return False
-    return normalize_toggle_value(item.data(Qt.UserRole), "0") == "1"
-
-
-def apply_toggle_cell_style(item, checked):
-    item.setData(Qt.UserRole, "1" if checked else "0")
-    item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
-    item.setBackground(TOGGLE_ON_COLOR if checked else TOGGLE_OFF_COLOR)
-    item.setText("")
-    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-
-
-def create_toggle_item(checked=True):
-    item = QTableWidgetItem("")
-    apply_toggle_cell_style(item, checked)
-    return item
-
-
 class FullPathEditDelegate(QStyledItemDelegate):
     """Open the line editor with the full stored path, not the shortened display text."""
 
@@ -520,19 +491,16 @@ class ToggleCheckBoxDelegate(QStyledItemDelegate):
         bg = index.data(Qt.ItemDataRole.BackgroundRole)
         if bg:
             painter.fillRect(option.rect, bg)
-        style = option.widget.style() if option.widget else QApplication.style()
-        checkbox_opt = QStyleOptionButton()
-        checkbox_opt.state = QStyle.StateFlag.State_Enabled
-        if is_toggle_checked_value(index.data(Qt.ItemDataRole.UserRole)):
-            checkbox_opt.state |= QStyle.StateFlag.State_On
-        indicator_size = style.pixelMetric(QStyle.PixelMetric.PM_IndicatorWidth, checkbox_opt, option.widget)
-        checkbox_opt.rect = QRect(
-            option.rect.x() + (option.rect.width() - indicator_size) // 2,
-            option.rect.y() + (option.rect.height() - indicator_size) // 2,
-            indicator_size,
-            indicator_size,
+        indicator_rect = QRect(
+            option.rect.x() + (option.rect.width() - CHECKBOX_INDICATOR_SIZE) // 2,
+            option.rect.y() + (option.rect.height() - CHECKBOX_INDICATOR_SIZE) // 2,
+            CHECKBOX_INDICATOR_SIZE,
+            CHECKBOX_INDICATOR_SIZE,
         )
-        style.drawControl(QStyle.ControlElement.CE_CheckBox, checkbox_opt, painter, option.widget)
+        checked = is_toggle_checked_value(index.data(Qt.ItemDataRole.UserRole))
+        hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+        enabled = bool(option.state & QStyle.StateFlag.State_Enabled)
+        paint_checkbox_indicator(painter, indicator_rect, checked, hovered, enabled)
 
     def editorEvent(self, event, model, option, index):
         if event.type() == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
@@ -614,12 +582,16 @@ class RenderQueueWorker(QThread):
       try:
           total = len(self.queue_data)
           self._log("worker_thread_start", total=total)
-          for job_index, item in enumerate(self.queue_data, start=1):
+          job_index = 0
+          while job_index < len(self.queue_data):
               if self.isInterruptionRequested():
                   cancelled = True
                   break
 
+              item = self.queue_data[job_index]
+              job_index += 1
               row = item["row"]
+              total = len(self.queue_data)
               self.progress_signal.emit(job_index, total, row)
               self._log(
                   "worker_job",
@@ -791,13 +763,6 @@ class RenderQueueWorker(QThread):
           except OSError:
               pass
 
-  def is_preview_frame(self, frame_path):
-      basename = os.path.basename(frame_path).lower()
-      if "aov" in basename:
-          return False
-      ext = os.path.splitext(frame_path)[1].lower()
-      return ext in {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp", ".exr"}
-
 class RenderManager(QWidget):
   def _apply_header_logo(self, logo_path):
       if not logo_path or not hasattr(self, "app_logo_label"):
@@ -816,7 +781,7 @@ class RenderManager(QWidget):
       self.current_language = "en"
       self.saved_geometry = None
       self.saved_splitter_state = None
-      self.initialized = False  # Prevent save_state() during initialization
+      self.initialized = False
       self.last_scanned_hip = None
       self.ui_elements = {}
       self.queue_thread = None
@@ -829,13 +794,11 @@ class RenderManager(QWidget):
       self._progress_ui_row = -1
       self._active_render_rows = []
       self._row_render_start = {}
-      self._job_duration_samples = []
       self._row_eta_meta = {}
       self._row_work_ratio = {}
       self._row_work_done = {}
       self._row_last_frame_mono = {}
       self._row_frame_seconds = {}
-      self._job_duration_samples = []
 
       self.setWindowTitle(TRANSLATIONS[self.current_language]["title"])
       icon_path = app_icon_path()
@@ -845,10 +808,9 @@ class RenderManager(QWidget):
       self.setMinimumSize(320, 120)
       main_layout = QVBoxLayout(self)
 
-      # --- Zone 1 ---
       group1 = QGroupBox(TRANSLATIONS[self.current_language]["zone1"])
       self.ui_elements["group1"] = group1
-      group1.setMaximumHeight(70)  # Zone 1: hython + action buttons
+      group1.setMaximumHeight(70)
       zone1 = QHBoxLayout()
       zone1.setContentsMargins(5, 5, 5, 5)
       self.houdini_version_label = QLabel(TRANSLATIONS[self.current_language]["houdini_version"])
@@ -920,7 +882,6 @@ class RenderManager(QWidget):
       top_layout.addWidget(group1, 1)
       self._top_bar.setMinimumSize(0, 0)
 
-      # --- Zone 2 & 3 & 4 ---
       group2 = QGroupBox(TRANSLATIONS[self.current_language]["zone2"])
       self.ui_elements["group2"] = group2
       group2.setToolTip(TRANSLATIONS[self.current_language]["zone2_tip"])
@@ -958,7 +919,6 @@ class RenderManager(QWidget):
       group2.setMinimumSize(0, 0)
       group2.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
-      # --- Zone 3 (fixed width) ---
       group3 = QGroupBox(TRANSLATIONS[self.current_language]["zone3"])
       self.ui_elements["group3"] = group3
       group3.setMinimumWidth(ZONE3_FIXED_WIDTH)
@@ -975,7 +935,6 @@ class RenderManager(QWidget):
       zone3.addWidget(self.scan_btn)
       group3.setLayout(zone3)
       
-      # --- Zone 4 ---
       group4 = QGroupBox(TRANSLATIONS[self.current_language]["zone4"])
       self.ui_elements["group4"] = group4
       group4.setToolTip(TRANSLATIONS[self.current_language]["zone4_tip"])
@@ -992,9 +951,9 @@ class RenderManager(QWidget):
       self.ui_elements["scan_hint_label"] = self.scan_hint_label
       zone4.addWidget(self.scan_hint_label)
       filter_layout = QHBoxLayout()
-      self.filter_redshift = QCheckBox(TRANSLATIONS[self.current_language]["redshift"])
-      self.filter_karma = QCheckBox(TRANSLATIONS[self.current_language]["karma"])
-      self.filter_other = QCheckBox(TRANSLATIONS[self.current_language]["other"])
+      self.filter_redshift = ThemedCheckBox(TRANSLATIONS[self.current_language]["redshift"])
+      self.filter_karma = ThemedCheckBox(TRANSLATIONS[self.current_language]["karma"])
+      self.filter_other = ThemedCheckBox(TRANSLATIONS[self.current_language]["other"])
       self.ui_elements["filter_redshift"] = self.filter_redshift
       self.ui_elements["filter_karma"] = self.filter_karma
       self.ui_elements["filter_other"] = self.filter_other
@@ -1053,7 +1012,6 @@ class RenderManager(QWidget):
       top_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
       self.ui_elements["top_container"] = top_container
 
-      # --- Zone 5 ---
       group5 = QGroupBox(TRANSLATIONS[self.current_language]["zone5"])
       self.ui_elements["group5"] = group5
       group5.setToolTip(TRANSLATIONS[self.current_language]["zone5_tip"])
@@ -1176,7 +1134,6 @@ class RenderManager(QWidget):
       group5.setMinimumSize(0, 0)
       group5.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
-      # --- Log ---
       self.log_output = QTextEdit()
       self.log_output.setReadOnly(True)
       self.log_output.setMinimumSize(0, 0)
@@ -1314,7 +1271,6 @@ class RenderManager(QWidget):
                       self.on_hip_selection_changed()
                       self.update_hip_current_visual()
               
-              # Restore queue
               if "queue" in data:
                   if data["queue"]:
                       for entry in data["queue"]:
@@ -1323,8 +1279,7 @@ class RenderManager(QWidget):
                       self.log_t("queue_restored", count=len(data["queue"]))
           except Exception as e:
               self.log_t("window_restore_error", e=e)
-      
-      # Ensure window is on screen
+
       screen = QApplication.primaryScreen().availableGeometry()
       geom = self.geometry()
       if geom.x() < 0 or geom.y() < 0 or geom.x() + geom.width() > screen.width() or geom.y() + geom.height() > screen.height():
@@ -1336,11 +1291,8 @@ class RenderManager(QWidget):
           if self.width() < 100: 
               self.resize(1200, 800)
       
-      # Apply translations after restore
-      self.language_btn.setText(self.current_language.upper())
       self.apply_translations()
-      
-      # Restore queue table column widths
+
       try:
           if os.path.exists(CONFIG_FILE):
               with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -1354,15 +1306,9 @@ class RenderManager(QWidget):
           self.log_t("column_widths_restore_error", e=e)
 
       self._restore_layout_splitters()
-      
-      # Copy hython helper scripts (+ deps) beside .exe before first render
       hython_script_path("render_rop.py")
       hython_script_path("scan_rops.py")
-      
-      # Update Start button based on queue
       self.update_start_button()
-      
-      # Mark initialization as complete
       self.initialized = True
       self._check_preview_dependencies()
 
@@ -1411,9 +1357,9 @@ class RenderManager(QWidget):
       preview_max_spin.setSingleStep(100)
       preview_max_spin.setValue(DEFAULT_PREVIEW_MAX_SIDE)
 
-      mp4_on_complete = QCheckBox(t["tg_mp4_on_complete"])
+      mp4_on_complete = ThemedCheckBox(t["tg_mp4_on_complete"])
       mp4_on_complete.setChecked(True)
-      mp4_use_preview = QCheckBox(t["tg_mp4_use_preview"])
+      mp4_use_preview = ThemedCheckBox(t["tg_mp4_use_preview"])
       mp4_use_preview.setChecked(True)
       mp4_max_spin = QSpinBox()
       mp4_max_spin.setRange(0, PREVIEW_MAX_SIDE_LIMIT)
@@ -1702,45 +1648,14 @@ class RenderManager(QWidget):
   def _on_queue_toggle_changed(self):
       if self.initialized:
           self.save_state()
-
-  def _make_readonly_item(self, text):
-      item = QTableWidgetItem(text)
-      item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-      return item
-
-  def _path_display(self, full_path):
-      if not full_path:
-          return ""
-      norm = full_path.replace("\\", "/")
-      parts = [p for p in norm.split("/") if p]
-      if len(norm) > 52 and len(parts) > 2:
-          return "…/" + "/".join(parts[-3:])
-      return full_path
-
-  def _make_path_item(self, full_path, editable=False, hip_file=None, op_name=None):
-      full_path = (full_path or "").strip()
-      item = QTableWidgetItem(self._path_display(full_path))
-      item.setData(FULL_PATH_ROLE, full_path)
-      tip = path_tooltip(full_path, hip_file, op_name)
-      if tip:
-          item.setToolTip(tip)
-      if not editable:
-          item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-      return item
-
-  def _get_cell_path(self, item):
-      if item is None:
-          return ""
-      stored = item.data(FULL_PATH_ROLE)
-      if stored:
-          return str(stored).strip()
-      return item.text().strip()
+      if self.queue_thread and self.queue_thread.isRunning():
+          for row in range(self.queue_table.rowCount()):
+              self._sync_live_render_job(row)
 
   def _on_path_cell_committed(self, row, col, path):
       """Called when user finishes editing HIP or Output path in the line editor."""
-      hip = self._get_cell_path(self.queue_table.item(row, COL_HIP)) if col == COL_OUTPUT else None
-      rop_item = self.queue_table.item(row, COL_ROP)
-      op_name = rop_item.text() if rop_item and col == COL_OUTPUT else None
+      hip = self.queue_model.get_path(row, COL_HIP) if col == COL_OUTPUT else None
+      op_name = self.queue_model.get_text(row, COL_ROP) if col == COL_OUTPUT else None
       path = normalize_output_template(path.strip()) if path else ""
       self._set_path_cell(row, col, path, hip_file=hip, op_name=op_name)
       if col == COL_OUTPUT and path:
@@ -1758,13 +1673,9 @@ class RenderManager(QWidget):
 
   def _queue_has_rop(self, hip_path, rop_name):
       for row in range(self.queue_table.rowCount()):
-          hip_item = self.queue_table.item(row, COL_HIP)
-          rop_item = self.queue_table.item(row, COL_ROP)
-          if not hip_item or not rop_item:
-              continue
           if (
-              norm_path_key(self._get_cell_path(hip_item)) == norm_path_key(hip_path)
-              and rop_item.text() == rop_name
+              norm_path_key(self.queue_model.get_path(row, COL_HIP)) == norm_path_key(hip_path)
+              and self.queue_model.get_text(row, COL_ROP) == rop_name
           ):
               return True
       return False
@@ -1784,7 +1695,7 @@ class RenderManager(QWidget):
       if row is None:
           self.log_t("select_queue_row")
           return
-      path = self._get_cell_path(self.queue_table.item(row, COL_HIP))
+      path = self.queue_model.get_path(row, COL_HIP)
       if path and os.path.isfile(path):
           os.startfile(path)
       else:
@@ -1795,13 +1706,12 @@ class RenderManager(QWidget):
       if row is None:
           self.log_t("select_queue_row")
           return
-      path = self._get_cell_path(self.queue_table.item(row, COL_OUTPUT))
-      hip = self._get_cell_path(self.queue_table.item(row, COL_HIP))
+      path = self.queue_model.get_path(row, COL_OUTPUT)
+      hip = self.queue_model.get_path(row, COL_HIP)
       if not path:
           self.log(TRANSLATIONS[self.current_language]["path_empty"])
           return
-      rop = self.queue_table.item(row, COL_ROP)
-      op_name = rop.text() if rop else None
+      op_name = self.queue_model.get_text(row, COL_ROP)
       probe = resolve_houdini_vars(path, hip, op_name)
       probe = re.sub(r"\$F\d*", "0001", probe)
       probe = re.sub(r"\$F\b", "1", probe)
@@ -1810,29 +1720,6 @@ class RenderManager(QWidget):
           os.startfile(folder)
       else:
           self.log_t("folder_not_found", folder=folder)
-
-  def _read_base_resolution(self, row):
-      return self.queue_model.read_base_resolution(row)
-
-  def _set_base_resolution(self, row, base_x, base_y):
-      self.queue_model.set_resize(
-          row,
-          self.queue_model.get_text(row, 9) or "100%",
-          base_x=base_x,
-          base_y=base_y,
-      )
-
-  def _parse_resize_pct(self, resize_text):
-      if not resize_text:
-          return 100.0
-      text = str(resize_text).strip().rstrip("%")
-      try:
-          return float(text) if text else 100.0
-      except ValueError:
-          return 100.0
-
-  def _resolve_render_size(self, row, base_x=None, base_y=None):
-      return self.queue_model.resolve_render_size(row, base_x=base_x, base_y=base_y)
 
   def _apply_resize_display(self, row, base_x=None, base_y=None):
       if base_x is not None or base_y is not None:
@@ -1959,24 +1846,17 @@ class RenderManager(QWidget):
           return None
       return sec_per * (work_total - work_done)
 
-  def _avg_job_seconds(self):
-      if not self._job_duration_samples:
-          return None
-      return sum(self._job_duration_samples) / len(self._job_duration_samples)
-
   def _estimate_job_seconds(self, row):
       meta = self._row_eta_meta.get(row, {})
       work = meta.get("work_total")
       if work is not None and work <= 0:
           return 1.0
-      avg = self._avg_job_seconds()
-      if avg and avg > 0:
-          return avg
       cur = self._progress_ui_row
-      if cur >= 0:
-          sec_per = self._sec_per_frame_estimate(cur)
-          if sec_per and sec_per > 0 and work:
-              return sec_per * work
+      if cur < 0:
+          return None
+      sec_per = self._sec_per_frame_estimate(cur)
+      if sec_per and sec_per > 0 and work:
+          return sec_per * work
       return None
 
   def _eta_tip(self, seconds):
@@ -2054,34 +1934,163 @@ class RenderManager(QWidget):
       for row in range(self.queue_table.rowCount()):
           self.queue_model.set_eta_display(row, "--")
 
+  def _reset_row_frame_timing(self, row):
+      self._row_work_done[row] = 0
+      self._row_work_ratio.pop(row, None)
+      self._row_last_frame_mono.pop(row, None)
+      self._row_frame_seconds.pop(row, None)
+
+  def _register_eta_job(self, item, reset_timing=False):
+      row = item["row"]
+      if row not in self._active_render_rows:
+          self._active_render_rows.append(row)
+      skip = item["skip_val"] == "1"
+      work_total = item.get(
+          "work_total", item["end_frame"] - item["start_frame"] + 1
+      )
+      self._row_eta_meta[row] = {"skip": skip, "work_total": work_total}
+      if reset_timing:
+          self._reset_row_frame_timing(row)
+
+  def _sync_live_render_job(self, row):
+      if not self.queue_thread or not self.queue_thread.isRunning():
+          return
+      item = self._build_queue_item_from_row(row, log_skips=False)
+      job_idx = next(
+          (i for i, j in enumerate(self._render_jobs) if j.get("row") == row), None
+      )
+      if job_idx is None:
+          if item:
+              self._try_append_live_render_job(row)
+          return
+      if not item:
+          self._row_eta_meta.pop(row, None)
+          self._update_eta_displays()
+          return
+      self._render_jobs[job_idx].update(item)
+      skip = item["skip_val"] == "1"
+      self._row_eta_meta[row] = {
+          "skip": skip,
+          "work_total": item.get(
+              "work_total", item["end_frame"] - item["start_frame"] + 1
+          ),
+      }
+      self._update_eta_displays()
+
   def _start_eta_tracking(self, queue_data):
       self._active_render_rows = [item["row"] for item in queue_data]
       self._row_render_start = {}
-      self._job_duration_samples = []
       self._row_eta_meta = {}
       self._row_work_ratio = {}
       self._row_work_done = {}
       self._row_last_frame_mono = {}
       self._row_frame_seconds = {}
       for item in queue_data:
-          row = item["row"]
-          skip = item["skip_val"] == "1"
-          work_total = item.get(
-              "work_total", item["end_frame"] - item["start_frame"] + 1
-          )
-          self._row_eta_meta[row] = {"skip": skip, "work_total": work_total}
+          self._register_eta_job(item, reset_timing=True)
       self._clear_all_eta_displays()
 
   def _stop_eta_tracking(self):
       self._active_render_rows = []
       self._row_render_start = {}
-      self._job_duration_samples = []
       self._row_eta_meta = {}
       self._row_work_ratio = {}
       self._row_work_done = {}
       self._row_last_frame_mono = {}
       self._row_frame_seconds = {}
       self._clear_all_eta_displays()
+
+  def _build_queue_item_from_row(self, row, log_skips=True):
+      entry = self.queue_model.row_to_entry(row)
+      if not is_toggle_checked_value(entry.get("enabled")):
+          if log_skips:
+              self.log_t("row_disabled", row=row + 1)
+          return None
+
+      hip_file = str(entry.get("hip", "") or "").strip()
+      rop_name = str(entry.get("rop", "") or "").strip()
+      rop_type = str(entry.get("type", "") or "").strip()
+      output_path = str(entry.get("output_path", "") or "").strip()
+      skip_val = "1" if is_toggle_checked_value(entry.get("skip")) else "0"
+
+      if not hip_file or not rop_name:
+          if log_skips:
+              self.log_t("row_no_hip_rop", row=row + 1)
+          return None
+
+      if not os.path.isfile(hip_file):
+          if log_skips:
+              self.log_t("row_hip_missing", row=row + 1, hip_file=hip_file)
+          return None
+
+      if not output_path and log_skips:
+          self.log_t(
+              "row_path_empty",
+              row=row + 1,
+              rop_name=rop_name,
+              detail=TRANSLATIONS[self.current_language]["path_empty"],
+          )
+
+      try:
+          start_frame = int(entry.get("start_frame", 1) or 1)
+          end_frame = int(entry.get("end_frame", 100) or 100)
+      except (TypeError, ValueError):
+          if log_skips:
+              self.log_t("row_bad_frames", row=row + 1)
+          start_frame = 1
+          end_frame = 100
+
+      try:
+          send2bot = int(entry.get("send2bot", 0) or 0)
+          if send2bot < 0:
+              send2bot = 0
+      except (TypeError, ValueError):
+          send2bot = 0
+
+      send_mp4 = is_toggle_checked_value(entry.get("send_mp4"))
+      base_x, base_y, resize_pct, actual_x, actual_y = self.queue_model.resolve_render_size(row)
+
+      work_total = end_frame - start_frame + 1
+      if skip_val == "1" and output_path:
+          work_total = len(
+              missing_render_frames(
+                  output_path, start_frame, end_frame, hip_file, rop_name
+              )
+          )
+
+      return {
+          "row": row,
+          "hip_file": hip_file,
+          "rop_name": rop_name,
+          "rop_type": rop_type,
+          "start_frame": start_frame,
+          "end_frame": end_frame,
+          "skip_val": skip_val,
+          "work_total": work_total,
+          "size_x": base_x,
+          "size_y": base_y,
+          "resize_pct": resize_pct,
+          "render_width": actual_x,
+          "render_height": actual_y,
+          "output_path": output_path,
+          "send2bot": send2bot,
+          "send_mp4": send_mp4,
+      }
+
+  def _try_append_live_render_job(self, row):
+      if not self.queue_thread or not self.queue_thread.isRunning():
+          return False
+      if any(j.get("row") == row for j in self._render_jobs):
+          return False
+      item = self._build_queue_item_from_row(row, log_skips=False)
+      if not item:
+          return False
+      self._render_jobs.append(item)
+      self.queue_thread.queue_data.append(item)
+      self._render_job_total = len(self._render_jobs)
+      self._register_eta_job(item, reset_timing=True)
+      self._update_eta_displays()
+      self.log_t("render_job_appended", row=row + 1, rop_name=item["rop_name"])
+      return True
 
   def update_rop_count_label(self):
       t = TRANSLATIONS[self.current_language]
@@ -2265,6 +2274,7 @@ class RenderManager(QWidget):
                   detail=TRANSLATIONS[self.current_language]["path_empty"],
               )
           added += 1
+          self._try_append_live_render_job(row)
 
       self.log_t("rops_added", count=added)
       self.update_start_button()
@@ -2356,12 +2366,10 @@ class RenderManager(QWidget):
       self.log_t("log_cleared")
 
   def save_state(self):
-      # Prevent saving during initialization
       if not self.initialized:
           return
-      
+
       try:
-          # Read existing config to preserve other settings (like telegram)
           data = {}
           if os.path.exists(CONFIG_FILE):
               try:
@@ -2370,35 +2378,24 @@ class RenderManager(QWidget):
               except (json.JSONDecodeError, IOError):
                   data = {}
 
-          # Save Houdini path
           data["hython_path"] = self.houdini_versions.currentText()
-
-          # Save HIP files
           data["hip_files"] = [self.hip_list.item(i).text() for i in range(self.hip_list.count())]
-          
-          # Save queue
           data["queue"] = [
               self._queue_row_to_entry(row)
               for row in range(self.queue_table.rowCount())
           ]
-
-          # Save language
           data["language"] = self.current_language
-          
-          # Save window geometry
+
           try:
               geometry_hex = self.saveGeometry().toHex().data().decode()
               if geometry_hex:
                   data["geometry"] = geometry_hex
-                  
-                  # Also save explicit width/height and position for fallback or manual check
                   if "ui" not in data:
                       data["ui"] = {}
                   data["ui"]["width"] = self.width()
                   data["ui"]["height"] = self.height()
                   data["ui"]["x"] = self.x()
                   data["ui"]["y"] = self.y()
-                  
                   splitter_hex = self._splitter_state_hex(self.main_splitter)
                   if splitter_hex:
                       data["splitter_state"] = splitter_hex
@@ -2419,8 +2416,7 @@ class RenderManager(QWidget):
                           data["ui"]["top_zones_splitter_state"] = top_zones_hex
           except Exception as e:
               self.log_t("save_geom_error", e=e)
-          
-          # Save queue table column widths
+
           try:
               if "ui" not in data:
                   data["ui"] = {}
@@ -2428,7 +2424,6 @@ class RenderManager(QWidget):
           except Exception as e:
               self.log_t("save_columns_error", e=e)
 
-          # Write config with explicit encoding
           with open(CONFIG_FILE, "w", encoding="utf-8") as f:
               json.dump(data, f, indent=4, ensure_ascii=False)
       except Exception as e:
@@ -2468,78 +2463,9 @@ class RenderManager(QWidget):
 
       queue_data = []
       for row in range(self.queue_model.rowCount()):
-          entry = self.queue_model.row_to_entry(row)
-          if not is_toggle_checked_value(entry.get("enabled")):
-              self.log_t("row_disabled", row=row + 1)
-              continue
-
-          hip_file = str(entry.get("hip", "") or "").strip()
-          rop_name = str(entry.get("rop", "") or "").strip()
-          rop_type = str(entry.get("type", "") or "").strip()
-          output_path = str(entry.get("output_path", "") or "").strip()
-          skip_val = "1" if is_toggle_checked_value(entry.get("skip")) else "0"
-
-          try:
-              send2bot = int(entry.get("send2bot", 0) or 0)
-              if send2bot < 0:
-                  send2bot = 0
-          except (TypeError, ValueError):
-              send2bot = 0
-
-          send_mp4 = is_toggle_checked_value(entry.get("send_mp4"))
-
-          if not hip_file or not rop_name:
-              self.log_t("row_no_hip_rop", row=row + 1)
-              continue
-
-          if not os.path.isfile(hip_file):
-              self.log_t("row_hip_missing", row=row + 1, hip_file=hip_file)
-              continue
-
-          if not output_path:
-              self.log_t(
-                  "row_path_empty",
-                  row=row + 1,
-                  rop_name=rop_name,
-                  detail=TRANSLATIONS[self.current_language]["path_empty"],
-              )
-
-          try:
-              start_frame = int(entry.get("start_frame", 1) or 1)
-              end_frame = int(entry.get("end_frame", 100) or 100)
-          except (TypeError, ValueError):
-              self.log_t("row_bad_frames", row=row + 1)
-              start_frame = 1
-              end_frame = 100
-
-          base_x, base_y, resize_pct, actual_x, actual_y = self.queue_model.resolve_render_size(row)
-
-          work_total = end_frame - start_frame + 1
-          if skip_val == "1" and output_path:
-              work_total = len(
-                  missing_render_frames(
-                      output_path, start_frame, end_frame, hip_file, rop_name
-                  )
-              )
-
-          queue_data.append({
-              "row": row,
-              "hip_file": hip_file,
-              "rop_name": rop_name,
-              "rop_type": rop_type,
-              "start_frame": start_frame,
-              "end_frame": end_frame,
-              "skip_val": skip_val,
-              "work_total": work_total,
-              "size_x": base_x,
-              "size_y": base_y,
-              "resize_pct": resize_pct,
-              "render_width": actual_x,
-              "render_height": actual_y,
-              "output_path": output_path,
-              "send2bot": send2bot,
-              "send_mp4": send_mp4,
-          })
+          item = self._build_queue_item_from_row(row)
+          if item:
+              queue_data.append(item)
 
       if not queue_data:
           self.log_t("no_enabled_jobs")
@@ -2594,6 +2520,7 @@ class RenderManager(QWidget):
       self._render_job_total = total
       if self._progress_ui_row != row:
           self._active_render_ratio = 0.0
+          self._reset_row_frame_timing(row)
           for r in range(self.queue_table.rowCount()):
               if r != row:
                   self._set_status_render_progress(r, None)
@@ -2645,18 +2572,12 @@ class RenderManager(QWidget):
   def on_worker_update_row(self, row, status, start_time, end_time):
       if status == "Running":
           self._row_render_start[row] = time.monotonic()
-          self._row_work_done[row] = 0
-          self._row_last_frame_mono.pop(row, None)
-          self._row_frame_seconds.pop(row, None)
+          self._reset_row_frame_timing(row)
           self._set_status_render_progress(row, 0.0)
           self.queue_model.set_times(row, start_time=start_time, end_time="")
           self._update_eta_displays()
           return
-      start_mono = self._row_render_start.pop(row, None)
-      if start_mono and status == "Completed":
-          dur = time.monotonic() - start_mono
-          if dur >= 1.0:
-              self._job_duration_samples.append(dur)
+      self._row_render_start.pop(row, None)
       self._row_work_ratio.pop(row, None)
       self._set_status_render_progress(row, None)
       self.queue_model.set_status(row, status, progress=None)
@@ -2696,14 +2617,6 @@ class RenderManager(QWidget):
       set_disabled_style(self.stop_btn)
       self.update_start_button()
       self.save_state()
-
-  def _collect_queue_entries(self):
-      return self.queue_model.all_entries()
-
-  def _restore_queue_entries(self, entries):
-      self.queue_model.load_entries(entries)
-      self.update_start_button()
-      self.on_queue_selection_changed()
 
   def _move_queue_row(self, src_row, dest_row):
       if self.queue_thread and self.queue_thread.isRunning():
@@ -2746,6 +2659,7 @@ class RenderManager(QWidget):
       new_row = row + 1
       self._populate_queue_row(new_row, entry=entry)
       self.queue_table.selectRow(new_row)
+      self._try_append_live_render_job(new_row)
       self.update_start_button()
       self.on_queue_selection_changed()
       if self.initialized:
@@ -2858,6 +2772,10 @@ class RenderManager(QWidget):
 
       if col not in (0, 6, COL_SEND_MP4):
           self.save_state()
+
+      if self.queue_thread and self.queue_thread.isRunning():
+          if col in (0, 4, 5, 6, COL_OUTPUT):
+              self._sync_live_render_job(row)
 
   def _on_queue_double_clicked(self, index):
       if not index.isValid():
@@ -3001,31 +2919,3 @@ class RenderManager(QWidget):
 
   def load_filters(self):
       self.filter_redshift.setChecked(True)
-
-def main():
-  import sys
-  app = QApplication(sys.argv)
-  
-  # Load language from config
-  language = "en"
-  if os.path.exists(CONFIG_FILE):
-      try:
-          with open(CONFIG_FILE) as f:
-              data = json.load(f)
-              language = data.get("language", "en")
-      except json.JSONDecodeError:
-          pass
-
-  # Create window with dark theme
-  window = RenderManager()
-  window.current_language = language
-  apply_dark_theme(app)
-  
-  # Restore window state and translations
-  window.restore_window()
-  window.show()
-  
-  sys.exit(app.exec())
-
-if __name__ == "__main__":
-  main()

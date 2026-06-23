@@ -479,7 +479,7 @@ class RenderQueueModel(QAbstractTableModel):
 
 
 class QueueCellProxy:
-    """Thin adapter so existing code can call .text() / .data() like QTableWidgetItem."""
+    """Adapter so queue code can call .text() / .data() on model cells."""
 
     def __init__(self, model: RenderQueueModel, row: int, col: int):
         self._model = model
@@ -498,24 +498,6 @@ class QueueCellProxy:
 
     def setData(self, role, value):
         return self._model.setData(self._index, value, role)
-
-    def setBackground(self, _color):
-        return None
-
-    def setForeground(self, _color):
-        return None
-
-    def setFlags(self, _flags):
-        return None
-
-    def setToolTip(self, _tip):
-        return None
-
-    def setCheckState(self, _state):
-        return None
-
-    def setTextAlignment(self, _align):
-        return None
 
 
 def model_item(model, row, col):
@@ -561,20 +543,10 @@ class RenderQueueView(QTableView):
         m = self.model()
         return m.rowCount() if m else 0
 
-    def insertRow(self, row):
-        m = self.model()
-        if m:
-            m.insert_entry(row, _empty_row())
-
     def removeRow(self, row):
         m = self.model()
         if m:
             m.remove_rows(row, 1)
-
-    def setRowCount(self, count):
-        m = self.model()
-        if m:
-            m.load_entries([_empty_row() for _ in range(count)] if count else [])
 
     def selectRow(self, row):
         m = self.model()
@@ -590,47 +562,14 @@ class RenderQueueView(QTableView):
         if proxy and hasattr(proxy, "_index"):
             self.scrollTo(proxy._index)
 
-    def update(self, index):
-        m = self.model()
-        if m and index.isValid():
-            m.dataChanged.emit(index, index)
-
-    def blockSignals(self, block):
-        m = self.model()
-        if m:
-            return m.blockSignals(block)
-        return super().blockSignals(block)
-
-    def signalsBlocked(self):
-        m = self.model()
-        return m.signalsBlocked() if m else super().signalsBlocked()
-
     def setHorizontalHeaderLabels(self, labels):
         m = self.model()
         if m and hasattr(m, "set_headers"):
             m.set_headers(labels)
 
-    def setColumnCount(self, _count):
-        pass
-
     def columnCount(self):
         m = self.model()
         return m.columnCount() if m else 0
-
-    def setItem(self, row, col, item):
-        """Legacy: accept QTableWidgetItem from old populate code paths."""
-        m = self.model()
-        if not m or item is None:
-            return
-        idx = m.index(row, col)
-        if col in TOGGLE_COLUMNS:
-            checked = is_toggle_checked_value(item.data(Qt.ItemDataRole.UserRole))
-            m.setData(idx, "1" if checked else "0", Qt.ItemDataRole.UserRole)
-        elif col in (COL_HIP, COL_OUTPUT):
-            full = item.data(FULL_PATH_ROLE) or item.text()
-            m.setData(idx, full, FULL_PATH_ROLE)
-        else:
-            m.setData(idx, item.text(), Qt.ItemDataRole.EditRole)
 
     def _insert_index_at(self, pos):
         idx = self.indexAt(pos)

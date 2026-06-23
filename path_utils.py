@@ -214,22 +214,3 @@ def missing_render_frames(output_path, start_frame, end_frame, hip_file=None, op
         output_path, start_frame, end_frame, hip_file, op_name
     )
     return sorted(expected - set(found.keys()))
-
-
-def all_render_frames_exist(output_path, start_frame, end_frame, hip_file=None, op_name=None):
-    """True only when every frame in the range has a non-empty file on disk."""
-    if not output_path:
-        return False
-    template = output_template_for_frames(output_path)
-    if not has_frame_tokens(template):
-        return False
-    return len(missing_render_frames(
-        output_path, start_frame, end_frame, hip_file, op_name
-    )) == 0
-
-
-def count_render_frames_on_disk(output_path, start_frame, end_frame, hip_file=None, op_name=None):
-    """How many frames in [start, end] exist on disk."""
-    return len(resolve_render_frames_on_disk(
-        output_path, start_frame, end_frame, hip_file, op_name
-    ))

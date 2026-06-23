@@ -102,11 +102,6 @@ def check_preview_dependencies():
     return False, f"Не установлены: {names}", hint
 
 
-def get_preview_max_side():
-    reload_config()
-    return PREVIEW_MAX_SIDE
-
-
 def _resolve_max_side(max_side):
     if max_side is None:
         reload_config()

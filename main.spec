@@ -1,7 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-block_cipher = None
 distpath = "dist-build"
 
 extra_datas = [
