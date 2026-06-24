@@ -25,7 +25,12 @@ from path_utils import (
 )
 
 from app_paths import config_path, hython_script_path
-from render_progress import work_progress_from_line, parse_redshift_rop_total_seconds
+from render_progress import (
+    HRM_FRAME_RE,
+    HRM_WORK_RE,
+    parse_redshift_rop_total_seconds,
+    work_progress_from_line,
+)
 
 from telegram_notifier import send_message
 
@@ -142,6 +147,16 @@ def _resolve_work_total(scene, rop, start_frame, end_frame, output_path, skip_ex
     except Exception:
         return total
 
+def _scene_frame_from_state(progress_state):
+    frame = progress_state.get("last_scene_frame")
+    if frame is None:
+        return -1
+    try:
+        return int(frame)
+    except (TypeError, ValueError):
+        return -1
+
+
 def _handle_output_line(line, start_frame, end_frame, progress_callback, progress_state):
     if not line:
         return progress_state
@@ -155,14 +170,34 @@ def _handle_output_line(line, start_frame, end_frame, progress_callback, progres
         wt = int(progress_state.get("work_total") or 0)
         if progress_callback and wt > 0:
             done = int(progress_state.get("last_work_done", 0)) + 1
-            progress_callback(min(1.0, done / wt), done, wt, rs_total)
+            progress_callback(
+                min(1.0, done / wt),
+                done,
+                wt,
+                rs_total,
+                _scene_frame_from_state(progress_state),
+            )
             progress_state["last_work_done"] = done
         return progress_state
 
     if not progress_callback:
         return progress_state
 
-    wp = work_progress_from_line(stripped, start_frame, end_frame)
+    m_frame = HRM_FRAME_RE.search(stripped)
+    if m_frame:
+        progress_state["last_scene_frame"] = int(m_frame.group(1))
+
+    if HRM_WORK_RE.search(stripped):
+        wp = work_progress_from_line(stripped, start_frame, end_frame)
+    elif m_frame:
+        full_span = max(0, int(end_frame) - int(start_frame) + 1)
+        work_total = int(progress_state.get("work_total") or 0)
+        if 0 < work_total < full_span:
+            return progress_state
+        wp = work_progress_from_line(stripped, start_frame, end_frame)
+    else:
+        wp = None
+
     if wp is None:
         return progress_state
     ratio, done, total = wp
@@ -173,7 +208,9 @@ def _handle_output_line(line, start_frame, end_frame, progress_callback, progres
             frame_sec = -1.0
         else:
             frame_sec = float(frame_sec)
-        progress_callback(ratio, done, total, frame_sec)
+        progress_callback(
+            ratio, done, total, frame_sec, _scene_frame_from_state(progress_state)
+        )
         progress_state["last_work_done"] = done
         if total > 0:
             progress_state["work_total"] = total
@@ -439,7 +476,7 @@ def run_render(
 
         if progress_callback:
             total_frames = max(0, int(end_frame) - int(start_frame) + 1)
-            progress_callback(0.0, 0, total_frames, -1.0)
+            progress_callback(0.0, 0, total_frames, -1.0, -1)
 
         output_for_cmd = ""
 
@@ -570,11 +607,19 @@ def run_render(
             last_done = progress_state.get("last_work_done", 0)
             if retcode == 0:
                 done = last_done if last_done > 0 else total_frames
-                progress_callback(1.0, done, done, -1.0)
+                progress_callback(
+                    1.0, done, done, -1.0, _scene_frame_from_state(progress_state)
+                )
             elif total_frames > 0:
-                progress_callback(last_done / total_frames, last_done, total_frames, -1.0)
+                progress_callback(
+                    last_done / total_frames,
+                    last_done,
+                    total_frames,
+                    -1.0,
+                    _scene_frame_from_state(progress_state),
+                )
             else:
-                progress_callback(0.0, 0, 0, -1.0)
+                progress_callback(0.0, 0, 0, -1.0, -1)
 
         if retcode == 0:
 

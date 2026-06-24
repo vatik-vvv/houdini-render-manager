@@ -27,6 +27,7 @@ from path_utils import (
     missing_render_frames,
 )
 from i18n import log_msg
+from render_progress import ratio_for_frame
 from PySide6.QtWidgets import (
       QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QListWidget, QComboBox,
       QFileDialog, QLabel, QDialog, QLineEdit,
@@ -35,7 +36,7 @@ from PySide6.QtWidgets import (
       QSizePolicy, QStyledItemDelegate, QStyle, QStyleOptionViewItem,
       QMessageBox, QMenu, QSpinBox, QProgressBar
   )
-from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap, QBrush, QPalette
 from PySide6.QtCore import Qt, QByteArray, QThread, Signal, QEvent, QRect, QSize, QTimer
 
 CONFIG_FILE = config_path()
@@ -452,33 +453,54 @@ class FullPathEditDelegate(QStyledItemDelegate):
 
 
 class StatusProgressDelegate(QStyledItemDelegate):
-    """Status cell: opaque green fill left-to-right for active render progress."""
+    """Status cell: green fill by frame progress + Running done/total text."""
+
+    @staticmethod
+    def _role_color(value, fallback):
+        if isinstance(value, QColor):
+            return value
+        if isinstance(value, QBrush):
+            return value.color()
+        if value is not None:
+            try:
+                return QColor(value)
+            except (TypeError, ValueError):
+                pass
+        return fallback
 
     def paint(self, painter, option, index):
-        progress = index.data(RENDER_PROGRESS_ROLE)
         try:
+            progress = index.data(RENDER_PROGRESS_ROLE)
             progress = max(0.0, min(1.0, float(progress))) if progress is not None else 0.0
         except (TypeError, ValueError):
             progress = 0.0
 
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
-
         rect = opt.rect
+        text = opt.text or ""
+
+        painter.save()
+        painter.setFont(opt.font)
+
         bg = index.data(Qt.ItemDataRole.BackgroundRole)
-        if bg:
-            painter.fillRect(rect, bg)
-        else:
-            style = opt.widget.style() if opt.widget else QApplication.style()
-            style.drawPrimitive(QStyle.PrimitiveElement.PE_PanelItemViewItem, opt, painter, opt.widget)
+        if bg is not None:
+            painter.fillRect(rect, bg if isinstance(bg, QColor) else QBrush(bg))
 
         if progress > 0:
-            fill_w = max(0, int(rect.width() * progress))
+            fill_w = max(1, int(rect.width() * progress))
             painter.fillRect(rect.x(), rect.y(), fill_w, rect.height(), TOGGLE_ON_COLOR)
 
-        style = opt.widget.style() if opt.widget else QApplication.style()
-        opt.textElideMode = Qt.TextElideMode.ElideRight
-        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, opt.widget)
+        fg = index.data(Qt.ItemDataRole.ForegroundRole)
+        painter.setPen(
+            QPen(self._role_color(fg, opt.palette.color(QPalette.ColorRole.Text)))
+        )
+        painter.drawText(
+            rect.adjusted(6, 0, -4, 0),
+            int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
+            text,
+        )
+        painter.restore()
 
 
 class ToggleCheckBoxDelegate(QStyledItemDelegate):
@@ -565,7 +587,7 @@ class RenderQueueWorker(QThread):
   log_signal = Signal(str)
   update_row_signal = Signal(int, str, str, str)
   progress_signal = Signal(int, int, int)
-  frame_progress_signal = Signal(int, float, int, int, float)
+  frame_progress_signal = Signal(int, float, int, int, float, int)
   finished_signal = Signal(bool)
 
   def __init__(self, queue_data, language="en", parent=None):
@@ -654,8 +676,8 @@ class RenderQueueWorker(QThread):
                       frame_cb = lambda f, p, it=item: self.send_frame_preview(f, p, it["rop_name"])
 
                   progress_cb = (
-                      lambda ratio, wd, wt, fs, r=row: self.frame_progress_signal.emit(
-                          r, ratio, wd, wt, fs
+                      lambda ratio, wd, wt, fs, sf, r=row: self.frame_progress_signal.emit(
+                          r, ratio, wd, wt, fs, sf
                       )
                   )
 
@@ -1766,17 +1788,64 @@ class RenderManager(QWidget):
       )
       self.setWindowTitle(f"{t['title']} — {status} ({cur}/{total})")
 
-  def _apply_row_progress(self, row, ratio):
+  def _work_total_for_row(self, row):
+      meta = self._row_eta_meta.get(row, {})
+      work_total = meta.get("work_total")
+      if work_total is not None:
+          try:
+              return int(work_total)
+          except (TypeError, ValueError):
+              pass
+      return 0
+
+  def _frame_range_ratio(self, row, work_done=0, work_total=0, scene_frame=-1):
+      """Progress across the full start_frame..end_frame range (includes frames already on disk)."""
+      meta = self._row_eta_meta.get(row, {})
+      try:
+          start = int(meta.get("start_frame", 0))
+          end = int(meta.get("end_frame", 0))
+      except (TypeError, ValueError):
+          return 0.0
+      span = end - start + 1
+      if span <= 0:
+          return 1.0 if work_done > 0 else 0.0
+      try:
+          sf = int(scene_frame)
+      except (TypeError, ValueError):
+          sf = -1
+      if sf >= start:
+          return ratio_for_frame(sf, start, end)
+      try:
+          wt = int(work_total) if work_total > 0 else int(meta.get("work_total") or span)
+          wd = int(work_done)
+      except (TypeError, ValueError):
+          wt, wd = span, 0
+      pre_existing = max(0, span - wt)
+      return min(1.0, max(0.0, (pre_existing + wd) / float(span)))
+
+  def _apply_row_progress(self, row, ratio, work_done=0, work_total=0, scene_frame=-1):
       try:
           ratio = max(0.0, min(1.0, float(ratio)))
       except (TypeError, ValueError):
           ratio = 0.0
       meta = self._row_eta_meta.get(row, {})
+      status_ratio = ratio
       if meta.get("skip") and meta.get("work_total", 0) > 0:
-          ratio = max(self._row_work_ratio.get(row, 0.0), ratio)
-          self._row_work_ratio[row] = ratio
-      self._active_render_ratio = ratio
-      self._set_status_render_progress(row, ratio)
+          status_ratio = max(self._row_work_ratio.get(row, 0.0), ratio)
+          self._row_work_ratio[row] = status_ratio
+      self._active_render_ratio = self._frame_range_ratio(
+          row, work_done, work_total, scene_frame
+      )
+      try:
+          work_done = int(work_done)
+          work_total = int(work_total)
+      except (TypeError, ValueError):
+          work_done, work_total = 0, self._work_total_for_row(row)
+      if work_total <= 0:
+          work_total = self._work_total_for_row(row)
+      self._set_status_render_progress(
+          row, status_ratio, work_done=work_done, work_total=work_total, scene_frame=scene_frame
+      )
       cur = min(self._jobs_done + 1, self._render_job_total) if self._render_job_total else 1
       self._update_global_progress(cur, self._render_job_total, row, "Running")
 
@@ -1948,7 +2017,12 @@ class RenderManager(QWidget):
       work_total = item.get(
           "work_total", item["end_frame"] - item["start_frame"] + 1
       )
-      self._row_eta_meta[row] = {"skip": skip, "work_total": work_total}
+      self._row_eta_meta[row] = {
+          "skip": skip,
+          "work_total": work_total,
+          "start_frame": item["start_frame"],
+          "end_frame": item["end_frame"],
+      }
       if reset_timing:
           self._reset_row_frame_timing(row)
 
@@ -1974,6 +2048,8 @@ class RenderManager(QWidget):
           "work_total": item.get(
               "work_total", item["end_frame"] - item["start_frame"] + 1
           ),
+          "start_frame": item["start_frame"],
+          "end_frame": item["end_frame"],
       }
       self._update_eta_displays()
 
@@ -2493,25 +2569,28 @@ class RenderManager(QWidget):
       self.queue_thread.start()
       self.log_t("thread_started", count=len(queue_data))
 
-  def _set_status_render_progress(self, row, ratio=None):
+  def _set_status_render_progress(self, row, ratio=None, work_done=None, work_total=None, scene_frame=None):
       if ratio is None:
-          self.queue_model.set_status(
-              row, self.queue_model.get_text(row, COL_STATUS), progress=None
-          )
+          self.queue_model.clear_render_progress(row)
       else:
-          self.queue_model.set_status(row, "Running", progress=float(ratio))
+          kwargs = {"progress": float(ratio)}
+          if work_done is not None:
+              kwargs["work_done"] = work_done
+          if work_total is not None:
+              kwargs["work_total"] = work_total
+          if scene_frame is not None:
+              kwargs["scene_frame"] = scene_frame
+          self.queue_model.set_status(row, "Running", **kwargs)
 
   def _clear_all_status_render_progress(self):
       for row in range(self.queue_table.rowCount()):
           if self.queue_model.data(
               self.queue_model.index(row, COL_STATUS), RENDER_PROGRESS_ROLE
           ) is not None:
-              self.queue_model.set_status(
-                  row, self.queue_model.get_text(row, COL_STATUS), progress=None
-              )
+              self.queue_model.clear_render_progress(row)
 
-  def on_render_frame_progress(self, row, ratio, work_done, work_total, frame_seconds):
-      self._apply_row_progress(row, ratio)
+  def on_render_frame_progress(self, row, ratio, work_done, work_total, frame_seconds, scene_frame):
+      self._apply_row_progress(row, ratio, work_done, work_total, scene_frame)
       if work_done > 0:
           self._on_frame_rendered(row, work_done, work_total, frame_seconds)
 
@@ -2519,12 +2598,13 @@ class RenderManager(QWidget):
       self._render_job_cur = cur
       self._render_job_total = total
       if self._progress_ui_row != row:
-          self._active_render_ratio = 0.0
+          work_total = self._work_total_for_row(row)
+          self._active_render_ratio = self._frame_range_ratio(row, 0, work_total)
           self._reset_row_frame_timing(row)
           for r in range(self.queue_table.rowCount()):
               if r != row:
                   self._set_status_render_progress(r, None)
-          self._set_status_render_progress(row, 0.0)
+          self._set_status_render_progress(row, 0.0, work_done=0, work_total=self._work_total_for_row(row))
       self._progress_ui_row = row
       self._update_global_progress(cur, total, row, "Running")
       self._update_eta_displays()
@@ -2573,7 +2653,9 @@ class RenderManager(QWidget):
       if status == "Running":
           self._row_render_start[row] = time.monotonic()
           self._reset_row_frame_timing(row)
-          self._set_status_render_progress(row, 0.0)
+          work_total = self._work_total_for_row(row)
+          self._active_render_ratio = self._frame_range_ratio(row, 0, work_total)
+          self._set_status_render_progress(row, 0.0, work_done=0, work_total=work_total)
           self.queue_model.set_times(row, start_time=start_time, end_time="")
           self._update_eta_displays()
           return

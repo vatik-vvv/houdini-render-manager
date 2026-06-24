@@ -80,6 +80,9 @@ def _empty_row():
         "size_x_base": "1920",
         "size_y_base": "1080",
         "_progress": None,
+        "_work_done": None,
+        "_work_total": None,
+        "_scene_frame": None,
         "_eta_display": "--",
         "_eta_tooltip": "",
     }
@@ -201,13 +204,20 @@ class RenderQueueModel(QAbstractTableModel):
 
         if col == COL_STATUS:
             status = entry.get("status", "Queued")
+            if isinstance(status, str) and status.startswith("Running "):
+                status = "Running"
             if role == Qt.ItemDataRole.DisplayRole:
                 if status == "Running":
-                    prog = entry.get("_progress")
-                    if prog is not None:
+                    total = entry.get("_work_total")
+                    if total is not None:
                         try:
-                            pct = int(float(prog) * 100)
-                            return f"Running {pct}%"
+                            work_total = int(total)
+                            work_done = int(entry.get("_work_done") or 0)
+                            progress = f"{work_done}/{work_total}"
+                            scene_frame = entry.get("_scene_frame")
+                            if scene_frame is not None:
+                                return f"{int(scene_frame)} ({progress})"
+                            return f"Running {progress}"
                         except (TypeError, ValueError):
                             pass
                 return status
@@ -359,19 +369,46 @@ class RenderQueueModel(QAbstractTableModel):
         self.endResetModel()
         return True
 
-    def set_status(self, row, status, progress=None):
+    def clear_render_progress(self, row):
         if row < 0 or row >= len(self._rows):
             return
+        self._rows[row]["_progress"] = None
+        self._rows[row]["_scene_frame"] = None
+        idx = self.index(row, COL_STATUS)
+        self.dataChanged.emit(idx, idx, [RENDER_PROGRESS_ROLE, Qt.ItemDataRole.DisplayRole])
+
+    def set_status(self, row, status, progress=None, work_done=None, work_total=None, scene_frame=None):
+        if row < 0 or row >= len(self._rows):
+            return
+        if isinstance(status, str) and status.startswith("Running "):
+            status = "Running"
         self._rows[row]["status"] = status
         if progress is not None:
             self._rows[row]["_progress"] = progress
-        elif status != "Running":
+        if work_done is not None:
+            self._rows[row]["_work_done"] = work_done
+        if work_total is not None:
+            self._rows[row]["_work_total"] = work_total
+        if scene_frame is not None:
+            try:
+                self._rows[row]["_scene_frame"] = int(scene_frame) if int(scene_frame) >= 0 else None
+            except (TypeError, ValueError):
+                pass
+        if status != "Running":
             self._rows[row]["_progress"] = None
+            self._rows[row]["_work_done"] = None
+            self._rows[row]["_work_total"] = None
+            self._rows[row]["_scene_frame"] = None
         idx = self.index(row, COL_STATUS)
         self.dataChanged.emit(
             idx,
             idx,
-            [RENDER_PROGRESS_ROLE, Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.BackgroundRole],
+            [
+                RENDER_PROGRESS_ROLE,
+                Qt.ItemDataRole.DisplayRole,
+                Qt.ItemDataRole.BackgroundRole,
+                Qt.ItemDataRole.ForegroundRole,
+            ],
         )
 
     def set_times(self, row, start_time=None, end_time=None, duration=None):
@@ -469,6 +506,9 @@ class RenderQueueModel(QAbstractTableModel):
         entry = self._rows[row]
         entry["status"] = "Queued"
         entry["_progress"] = None
+        entry["_work_done"] = None
+        entry["_work_total"] = None
+        entry["_scene_frame"] = None
         entry["start_time"] = ""
         entry["end_time"] = ""
         entry["duration"] = "--"

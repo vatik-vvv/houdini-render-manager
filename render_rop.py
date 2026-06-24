@@ -511,10 +511,9 @@ def render_frame_range(node, start, end, skip_on=False, output="", hip="", rop_n
             logger.error(str(e))
             sys.exit(1)
         work_done += 1
+        print(f"HRM_FRAME {frame}", flush=True)
         if skip_on and work_total > 0:
             print(f"HRM_WORK {work_done} {work_total}", flush=True)
-        else:
-            print(f"HRM_FRAME {frame}", flush=True)
 
 
 def main():
