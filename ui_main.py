@@ -1,4 +1,4 @@
-import os, json, re, subprocess, sys, time
+import os, json, re, subprocess, time
 from datetime import datetime, timedelta
 from render_runner import run_render, stop_render
 from telegram_notifier import send_image, send_video, get_mp4_max_side, test_bot_connection, send_message, reload_config
@@ -28,6 +28,7 @@ from path_utils import (
 )
 from i18n import log_msg
 from render_progress import ratio_for_frame
+from system_sleep import sleep_system
 from PySide6.QtWidgets import (
       QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QListWidget, QComboBox,
       QFileDialog, QLabel, QDialog, QLineEdit,
@@ -57,6 +58,12 @@ def _horizontal_button_bar(layout, height=34):
     scroll.setFixedHeight(height)
     scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
     return scroll
+
+
+def _wide_action_button(text):
+    btn = QPushButton(text)
+    btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+    return btn
 
 
 TRANSLATIONS = {
@@ -165,6 +172,8 @@ TRANSLATIONS = {
         "log_position_bottom": "Log: bottom",
         "log_position_right": "Log: right",
         "log_position_tip": "Toggle log panel position (bottom or right side)",
+        "sleep_on_queue_finish": "Sleep when queue finishes",
+        "sleep_on_queue_finish_tip": "Put the computer to sleep after the render queue completes (not when stopped).",
     },
     "ru": {
         "title": "Менеджер рендера Houdini",
@@ -271,6 +280,8 @@ TRANSLATIONS = {
         "log_position_bottom": "Лог: снизу",
         "log_position_right": "Лог: справа",
         "log_position_tip": "Переключить положение панели лога (снизу или справа)",
+        "sleep_on_queue_finish": "Усыпить ПК после очереди",
+        "sleep_on_queue_finish_tip": "Перевести компьютер в сон после завершения очереди рендера (не при остановке).",
     }
 }
 
@@ -1085,19 +1096,29 @@ class RenderManager(QWidget):
       zone5.addWidget(self.queue_table)
 
       btn_layout1 = QHBoxLayout()
-      self.start_btn = QPushButton(TRANSLATIONS[self.current_language]["start_render"])
+      self.start_btn = _wide_action_button(TRANSLATIONS[self.current_language]["start_render"])
       self.ui_elements["start_btn"] = self.start_btn
       self.start_btn.setEnabled(False)
       set_disabled_style(self.start_btn)
       self.start_btn.clicked.connect(self.start_render)
-      btn_layout1.addWidget(self.start_btn)
+      btn_layout1.addWidget(self.start_btn, 1)
 
-      self.stop_btn = QPushButton(TRANSLATIONS[self.current_language]["stop_render"])
+      self.stop_btn = _wide_action_button(TRANSLATIONS[self.current_language]["stop_render"])
       self.ui_elements["stop_btn"] = self.stop_btn
       self.stop_btn.setEnabled(False)
       set_disabled_style(self.stop_btn)
       self.stop_btn.clicked.connect(self.stop_render)
-      btn_layout1.addWidget(self.stop_btn)
+      btn_layout1.addWidget(self.stop_btn, 1)
+
+      self.sleep_on_finish_cb = ThemedCheckBox(
+          TRANSLATIONS[self.current_language]["sleep_on_queue_finish"]
+      )
+      self.sleep_on_finish_cb.setToolTip(
+          TRANSLATIONS[self.current_language]["sleep_on_queue_finish_tip"]
+      )
+      self.ui_elements["sleep_on_finish_cb"] = self.sleep_on_finish_cb
+      self.sleep_on_finish_cb.stateChanged.connect(lambda _state: self.save_state())
+      btn_layout1.addWidget(self.sleep_on_finish_cb, 0)
       zone5.addWidget(_horizontal_button_bar(btn_layout1, height=36))
 
       btn_layout2 = QHBoxLayout()
@@ -1263,9 +1284,9 @@ class RenderManager(QWidget):
                   self._splitter_states["queue"] = ui_cfg["queue_splitter_state"]
               if ui_cfg.get("top_zones_splitter_state"):
                   self._splitter_states["top_zones"] = ui_cfg["top_zones_splitter_state"]
-              log_pos = ui_cfg.get("log_position", "bottom")
-              if log_pos in ("bottom", "right"):
-                  self.log_position = log_pos
+              if ui_cfg.get("log_position", "bottom") in ("bottom", "right"):
+                  self.log_position = ui_cfg["log_position"]
+              self.sleep_on_finish_cb.setChecked(bool(ui_cfg.get("sleep_on_queue_finish", False)))
               if hasattr(self, "main_splitter"):
                   self.main_splitter.setOrientation(
                       Qt.Orientation.Vertical
@@ -1619,6 +1640,8 @@ class RenderManager(QWidget):
       self.ui_elements["open_hip_btn"].setText(t["open_hip"])
       self.ui_elements["open_output_btn"].setText(t["open_output"])
       self.ui_elements["duplicate_btn"].setText(t["duplicate"])
+      self.ui_elements["sleep_on_finish_cb"].setText(t["sleep_on_queue_finish"])
+      self.ui_elements["sleep_on_finish_cb"].setToolTip(t["sleep_on_queue_finish_tip"])
       
       self.queue_table.setHorizontalHeaderLabels(t["queue_headers"])
       self.queue_model.set_headers(t["queue_headers"])
@@ -1823,11 +1846,37 @@ class RenderManager(QWidget):
       pre_existing = max(0, span - wt)
       return min(1.0, max(0.0, (pre_existing + wd) / float(span)))
 
+  def _eta_meta_from_item(self, item):
+      skip = item["skip_val"] == "1"
+      return {
+          "skip": skip,
+          "work_total": item.get(
+              "work_total", item["end_frame"] - item["start_frame"] + 1
+          ),
+          "start_frame": item["start_frame"],
+          "end_frame": item["end_frame"],
+      }
+
+  def _reset_row_render_ui(self, row, reset_timing=True):
+      if reset_timing:
+          self._reset_row_frame_timing(row)
+      work_total = self._work_total_for_row(row)
+      self._active_render_ratio = self._frame_range_ratio(row, 0, work_total)
+      self._set_status_render_progress(row, 0.0, work_done=0, work_total=work_total)
+
   def _apply_row_progress(self, row, ratio, work_done=0, work_total=0, scene_frame=-1):
       try:
           ratio = max(0.0, min(1.0, float(ratio)))
       except (TypeError, ValueError):
           ratio = 0.0
+      try:
+          work_done = int(work_done)
+          work_total = int(work_total)
+      except (TypeError, ValueError):
+          work_done, work_total = 0, self._work_total_for_row(row)
+      if work_total <= 0:
+          work_total = self._work_total_for_row(row)
+
       meta = self._row_eta_meta.get(row, {})
       status_ratio = ratio
       if meta.get("skip") and meta.get("work_total", 0) > 0:
@@ -1836,13 +1885,6 @@ class RenderManager(QWidget):
       self._active_render_ratio = self._frame_range_ratio(
           row, work_done, work_total, scene_frame
       )
-      try:
-          work_done = int(work_done)
-          work_total = int(work_total)
-      except (TypeError, ValueError):
-          work_done, work_total = 0, self._work_total_for_row(row)
-      if work_total <= 0:
-          work_total = self._work_total_for_row(row)
       self._set_status_render_progress(
           row, status_ratio, work_done=work_done, work_total=work_total, scene_frame=scene_frame
       )
@@ -2013,16 +2055,7 @@ class RenderManager(QWidget):
       row = item["row"]
       if row not in self._active_render_rows:
           self._active_render_rows.append(row)
-      skip = item["skip_val"] == "1"
-      work_total = item.get(
-          "work_total", item["end_frame"] - item["start_frame"] + 1
-      )
-      self._row_eta_meta[row] = {
-          "skip": skip,
-          "work_total": work_total,
-          "start_frame": item["start_frame"],
-          "end_frame": item["end_frame"],
-      }
+      self._row_eta_meta[row] = self._eta_meta_from_item(item)
       if reset_timing:
           self._reset_row_frame_timing(row)
 
@@ -2042,15 +2075,7 @@ class RenderManager(QWidget):
           self._update_eta_displays()
           return
       self._render_jobs[job_idx].update(item)
-      skip = item["skip_val"] == "1"
-      self._row_eta_meta[row] = {
-          "skip": skip,
-          "work_total": item.get(
-              "work_total", item["end_frame"] - item["start_frame"] + 1
-          ),
-          "start_frame": item["start_frame"],
-          "end_frame": item["end_frame"],
-      }
+      self._row_eta_meta[row] = self._eta_meta_from_item(item)
       self._update_eta_displays()
 
   def _start_eta_tracking(self, queue_data):
@@ -2461,6 +2486,11 @@ class RenderManager(QWidget):
               for row in range(self.queue_table.rowCount())
           ]
           data["language"] = self.current_language
+          data["filters"] = {
+              "redshift": self.filter_redshift.isChecked(),
+              "karma": self.filter_karma.isChecked(),
+              "other": self.filter_other.isChecked(),
+          }
 
           try:
               geometry_hex = self.saveGeometry().toHex().data().decode()
@@ -2497,6 +2527,7 @@ class RenderManager(QWidget):
               if "ui" not in data:
                   data["ui"] = {}
               data["ui"]["column_widths"] = [self.queue_table.columnWidth(i) for i in range(self.queue_table.columnCount())]
+              data["ui"]["sleep_on_queue_finish"] = self.sleep_on_finish_cb.isChecked()
           except Exception as e:
               self.log_t("save_columns_error", e=e)
 
@@ -2598,13 +2629,10 @@ class RenderManager(QWidget):
       self._render_job_cur = cur
       self._render_job_total = total
       if self._progress_ui_row != row:
-          work_total = self._work_total_for_row(row)
-          self._active_render_ratio = self._frame_range_ratio(row, 0, work_total)
-          self._reset_row_frame_timing(row)
+          self._reset_row_render_ui(row)
           for r in range(self.queue_table.rowCount()):
               if r != row:
                   self._set_status_render_progress(r, None)
-          self._set_status_render_progress(row, 0.0, work_done=0, work_total=self._work_total_for_row(row))
       self._progress_ui_row = row
       self._update_global_progress(cur, total, row, "Running")
       self._update_eta_displays()
@@ -2645,17 +2673,12 @@ class RenderManager(QWidget):
       else:
           self.log_t("render_not_running")
 
-      self.stop_btn.setEnabled(False)
-      set_disabled_style(self.stop_btn)
-      self.update_start_button()
+      self._stop_render_controls()
 
   def on_worker_update_row(self, row, status, start_time, end_time):
       if status == "Running":
           self._row_render_start[row] = time.monotonic()
-          self._reset_row_frame_timing(row)
-          work_total = self._work_total_for_row(row)
-          self._active_render_ratio = self._frame_range_ratio(row, 0, work_total)
-          self._set_status_render_progress(row, 0.0, work_done=0, work_total=work_total)
+          self._reset_row_render_ui(row)
           self.queue_model.set_times(row, start_time=start_time, end_time="")
           self._update_eta_displays()
           return
@@ -2680,6 +2703,11 @@ class RenderManager(QWidget):
       )
       self._update_eta_displays()
 
+  def _stop_render_controls(self):
+      self.stop_btn.setEnabled(False)
+      set_disabled_style(self.stop_btn)
+      self.update_start_button()
+
   def on_queue_finished(self, cancelled):
       if cancelled:
           self.log_t("queue_cancelled")
@@ -2695,9 +2723,14 @@ class RenderManager(QWidget):
       self._progress_ui_row = -1
       self._stop_eta_tracking()
       self._update_global_progress(0, 0, -1, "")
-      self.stop_btn.setEnabled(False)
-      set_disabled_style(self.stop_btn)
-      self.update_start_button()
+      self._stop_render_controls()
+      if not cancelled and self.sleep_on_finish_cb.isChecked():
+          self.log_t("sleep_starting")
+          self.save_state()
+          ok, err = sleep_system()
+          if not ok:
+              self.log_t("sleep_failed", err=err or "?")
+          return
       self.save_state()
 
   def _move_queue_row(self, src_row, dest_row):
@@ -3000,4 +3033,14 @@ class RenderManager(QWidget):
       self.update_rop_count_label()
 
   def load_filters(self):
-      self.filter_redshift.setChecked(True)
+      defaults = {"redshift": True, "karma": False, "other": False}
+      filters = dict(defaults)
+      if os.path.exists(CONFIG_FILE):
+          try:
+              with open(CONFIG_FILE, encoding="utf-8") as f:
+                  filters.update(json.load(f).get("filters", {}))
+          except (json.JSONDecodeError, OSError):
+              pass
+      self.filter_redshift.setChecked(bool(filters.get("redshift", defaults["redshift"])))
+      self.filter_karma.setChecked(bool(filters.get("karma", defaults["karma"])))
+      self.filter_other.setChecked(bool(filters.get("other", defaults["other"])))

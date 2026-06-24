@@ -23,6 +23,7 @@ def ensure_files_exist():
                 "width": 1200,
                 "height": 800,
                 "log_position": "bottom",
+                "sleep_on_queue_finish": False,
             },
             "filters": {
                 "redshift": False,
